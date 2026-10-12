@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+*.manifest.json
+haos-installer-*-manifest.json
+haos_*.qcow2.xz
+*.qcow2
+*.img
+.DS_Store
