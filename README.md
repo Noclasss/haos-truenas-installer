@@ -6,16 +6,16 @@ This project is for community users who want a one-command, guided HAOS install 
 
 ## One-command launcher
 
-Pinned to a commit is safest. Replace `<commit>` with a published commit SHA from this repository:
+Pinned to a commit is safest. Replace `<commit>` with a published commit SHA from this repository. Preview mode may be run from `main`, but live installs intentionally refuse an unpinned `main` launcher unless you set `HAOS_TRUENAS_ALLOW_UNPINNED=1`.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sh -s -- --preview
+HAOS_TRUENAS_INSTALLER_REF=<commit> curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sh -s -- --preview
 ```
 
 When the preview looks correct, run without `--preview`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sh
+HAOS_TRUENAS_INSTALLER_REF=<commit> curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sh
 ```
 
 You can also set `HAOS_TRUENAS_INSTALLER_REF=<commit>` when using the launcher from a branch copy of `install.sh`.

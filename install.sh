@@ -2,6 +2,17 @@
 set -eu
 REPO="${HAOS_TRUENAS_INSTALLER_REPO:-https://github.com/Noclasss/haos-truenas-installer}"
 REF="${HAOS_TRUENAS_INSTALLER_REF:-main}"
+if [ "$REF" = "main" ] && [ "${HAOS_TRUENAS_ALLOW_UNPINNED:-}" != "1" ]; then
+  case " $* " in
+    *" --preview "*) : ;;
+    *)
+      printf '%s\n' "ERROR: refusing an unpinned live install from main." >&2
+      printf '%s\n' "Set HAOS_TRUENAS_INSTALLER_REF to a release tag or commit SHA, or run --preview first." >&2
+      printf '%s\n' "For testing only, set HAOS_TRUENAS_ALLOW_UNPINNED=1." >&2
+      exit 2
+      ;;
+  esac
+fi
 TMP="${TMPDIR:-/tmp}/haos-truenas-installer.$$"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT INT TERM
