@@ -28,6 +28,14 @@ class MidcltParsingTests(unittest.TestCase):
                 self.client().call("system.info")
 
 
+class LauncherTests(unittest.TestCase):
+    def test_launcher_passes_interactive_input_from_controlling_tty(self):
+        text = (ROOT / "install.sh").read_text()
+        self.assertIn("if [ -r /dev/tty ]; then", text)
+        self.assertIn('python3 "$SRC/haos_truenas_installer.py" "$@" </dev/tty', text)
+        self.assertIn('else\n    python3 "$SRC/haos_truenas_installer.py" "$@"', text)
+
+
 class StaticSafetyTests(unittest.TestCase):
     def test_version_gate(self):
         self.assertTrue(installer.version_supported("TrueNAS-25.10.0"))

@@ -31,7 +31,12 @@ fi
 tar -xzf "$TARBALL" -C "$TMP"
 SRC=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 if command -v python3 >/dev/null 2>&1; then
-  exec python3 "$SRC/haos_truenas_installer.py" "$@"
+  if [ -r /dev/tty ]; then
+    python3 "$SRC/haos_truenas_installer.py" "$@" </dev/tty
+  else
+    python3 "$SRC/haos_truenas_installer.py" "$@"
+  fi
+  exit $?
 fi
 printf '%s\n' "ERROR: python3 is required." >&2
 exit 1
