@@ -143,13 +143,13 @@ The HAOS image’s SHA-256 and expected size are checked before use. GitHub supp
 
 ## Preview mode
 
-Preview mode performs API reads only and prints the install plan:
+Preview mode queries TrueNAS and official HAOS release metadata, then prints the plan. From a local checkout, run:
 
 ```sh
 python3 haos_truenas_installer.py --preview
 ```
 
-Preview mode must not create datasets, zvols, VMs, devices, downloads or manifests.
+The one-command launcher first downloads the pinned installer source archive; preview does not download the HAOS image or write TrueNAS resources, cache entries, or manifests.
 
 ## Live-test limits
 
