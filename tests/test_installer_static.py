@@ -39,7 +39,7 @@ class ManifestPathTests(unittest.TestCase):
             self.assertEqual(installer.resolve_manifest_path(str(requested), "haos-test"), requested.resolve())
 
     def test_manifest_permission_error_is_actionable_and_aborts_before_download(self):
-        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haostest", "haostest", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
         args = installer.parse_args(["--vm-name", "haos-test"])
         with mock.patch.object(installer.os, "geteuid", return_value=0):
             with mock.patch.object(installer, "require_tools_for_install"):
@@ -50,7 +50,7 @@ class ManifestPathTests(unittest.TestCase):
                         download.assert_not_called()
 
     def test_non_root_live_install_aborts_before_manifest_or_download(self):
-        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haostest", "haostest", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
         args = installer.parse_args(["--vm-name", "haos-test"])
         with mock.patch.object(installer.os, "geteuid", return_value=1000):
             with mock.patch.object(installer, "download_and_verify") as download:
@@ -83,6 +83,12 @@ class StaticSafetyTests(unittest.TestCase):
             with self.assertRaises(installer.InstallerError):
                 installer.validate_name(bad, "test")
         self.assertEqual(installer.validate_name("haos_test-1", "test"), "haos_test-1")
+
+    def test_true_nas_vm_name_must_be_alphanumeric(self):
+        self.assertEqual(installer.validate_vm_name("HAOSTEST20261015105852"), "HAOSTEST20261015105852")
+        for bad in ["haos-test", "haos_test", "haos.test", ""]:
+            with self.assertRaisesRegex(installer.InstallerError, "only 1-63 ASCII letters and numbers"):
+                installer.validate_vm_name(bad)
 
     def test_preview_skips_host_tools(self):
         with mock.patch.object(installer.shutil, "which", return_value=None):
@@ -265,7 +271,7 @@ class PlanTests(unittest.TestCase):
                 installer.build_plan(client, self.args(**changes))
 
     def test_resume_manifest_accepts_only_exact_manifest_owned_partial_resources(self):
-        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haostest", "haostest", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
         with tempfile.TemporaryDirectory() as d:
             path = pathlib.Path(d) / "manifest.json"
             path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":[{"type":"dataset","id":"tank/haos-vms"},{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol}]}))
@@ -284,13 +290,33 @@ class PlanTests(unittest.TestCase):
             self.assertTrue(meta["resume"])
             self.assertFalse(any(c[0] in {"vm.create","pool.dataset.create","vm.device.create","vm.start"} for c in client.calls))
 
+    def test_resume_can_override_invalid_saved_vm_name_without_changing_zvol(self):
+        saved = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test-20261015-105852", "haos-test-20261015-105852", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        new_name="HAOSTEST20261015105852"
+        with tempfile.TemporaryDirectory() as d:
+            path=pathlib.Path(d)/"manifest.json"
+            resources=[{"type":"dataset","id":"tank/haos-vms"},{"type":"zvol","id":saved.zvol,"dev":"/dev/zvol/"+saved.zvol}]
+            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(saved),"resources":resources}))
+            args=installer.parse_args(["--resume-manifest",str(path),"--vm-name",new_name,"--no-start"])
+            client=self.base_client()
+            def dataset_query(params):
+                target=params[0][0][2]
+                if target==saved.zvol: return [{"id":saved.zvol,"type":"VOLUME","volsize":{"parsed":32*1024**3}}]
+                return [{"id":"tank/haos-vms","type":"FILESYSTEM"}]
+            client.responses["pool.dataset.query"]=dataset_query
+            resumed,meta=installer.build_plan(client,args)
+            self.assertEqual(resumed.vm_name,new_name)
+            self.assertEqual(resumed.zvol,saved.zvol)
+            self.assertTrue(meta["resume"])
+
     def test_resume_install_reuses_owned_zvol_and_creates_only_new_vm_devices(self):
-        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test-20261015-105852", "HAOSTEST20261015105852", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
         with tempfile.TemporaryDirectory() as d:
             path = pathlib.Path(d) / "manifest.json"
             resources = [{"type":"dataset","id":"tank/haos-vms"},{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol}]
-            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":resources}))
-            args = installer.parse_args(["--resume-manifest", str(path), "--no-start"])
+            saved_plan = installer.dataclasses.replace(plan,vm_name="haos-test-20261015-105852")
+            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(saved_plan),"resources":resources}))
+            args = installer.parse_args(["--resume-manifest", str(path), "--vm-name", plan.vm_name, "--no-start"])
             class ResumeClient:
                 def __init__(self): self.calls=[]
                 def call(self, method, params=None):
@@ -321,10 +347,12 @@ class PlanTests(unittest.TestCase):
             self.assertEqual([c[0] for c in client.calls].count("vm.device.create"),2)
             self.assertNotIn("vm.start",[c[0] for c in client.calls])
             convert.assert_called_once()
-            self.assertEqual([r["type"] for r in installer.json.loads(path.read_text())["resources"]], ["dataset","zvol","vm","device","device"])
+            final_manifest=installer.json.loads(path.read_text())
+            self.assertEqual([r["type"] for r in final_manifest["resources"]], ["dataset","zvol","vm","device","device"])
+            self.assertEqual(final_manifest["plan"]["vm_name"], plan.vm_name)
 
     def test_resume_preview_stays_read_only(self):
-        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haostest", "haostest", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
         with tempfile.TemporaryDirectory() as d:
             path = pathlib.Path(d) / "manifest.json"
             path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":[{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol}]}))
@@ -335,7 +363,7 @@ class PlanTests(unittest.TestCase):
             self.assertTrue(preview.preview)
 
     def test_resume_rejects_untracked_vm_or_device_resources(self):
-        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haostest", "haostest", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
         with tempfile.TemporaryDirectory() as d:
             path = pathlib.Path(d) / "manifest.json"
             path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":[{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol},{"type":"vm","name":"other"}]}))

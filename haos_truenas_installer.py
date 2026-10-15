@@ -167,6 +167,11 @@ def validate_name(name: str, what: str) -> str:
         raise InstallerError(f"Invalid {what} name. Use 1-63 letters, numbers, dots, underscores or hyphens, starting with a letter/number.")
     return name
 
+def validate_vm_name(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9]{1,63}", name):
+        raise InstallerError("Invalid VM name. TrueNAS accepts only 1-63 ASCII letters and numbers for VM names.")
+    return name
+
 def version_supported(version: str) -> bool:
     return any(p.match(version) for p in SUPPORTED_VERSION_PATTERNS)
 
@@ -225,11 +230,13 @@ def build_resume_plan(client, args, info: dict, version: str, required: list[str
         if data.get("tool") != APP or not isinstance(data.get("plan"), dict):
             raise ValueError("unrecognized manifest")
         plan = Plan(**data["plan"])
+        if args.vm_name:
+            plan = dataclasses.replace(plan, vm_name=validate_vm_name(args.vm_name))
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise InstallerError(f"Cannot read a valid installer manifest at {path}") from exc
     if plan.preview or plan.autostart or not version_supported(plan.true_version) or version != plan.true_version:
         raise InstallerError("Resume manifest is not a compatible live-install plan for this TrueNAS version")
-    validate_name(plan.vm_name, "VM")
+    validate_vm_name(plan.vm_name)
     validate_name(plan.pool, "pool")
     if not 2 <= plan.vcpus <= 16 or plan.ram_mib < 2048 or plan.disk_gib < 32:
         raise InstallerError("Resume manifest contains resources below the supported minimums")
@@ -318,7 +325,7 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     nics = (nic_choices.get("BRIDGE") or []) + (nic_choices.get("MACVLAN") or [])
     if not nics: raise InstallerError("No existing VM NIC attachment choices found. Refusing to alter host networking.")
     nic = args.nic or select_from("existing network attachment", nics, "br0" if "br0" in nics else ("br01" if "br01" in nics else nics[0]))
-    vm_name = validate_name(args.vm_name or ask("VM name", DEFAULTS["vm_name"]), "VM")
+    vm_name = validate_vm_name(args.vm_name or ask("VM name", DEFAULTS["vm_name"]))
     vcpus = args.vcpus if args.vcpus is not None else ask_int("CPU cores", DEFAULTS["vcpus"], 2, 16)
     ram_mib = args.ram_mib if args.ram_mib is not None else ask_int("RAM MiB", DEFAULTS["ram_mib"], 2048)
     disk_gib = args.disk_gib if args.disk_gib is not None else ask_int("Disk GiB", DEFAULTS["disk_gib"], 32)
@@ -519,8 +526,17 @@ def install(client, plan: Plan, args):
             manifest = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise InstallerError(f"Cannot read resume manifest at {manifest_path}") from exc
-        if manifest.get("tool") != APP or manifest.get("plan") != dataclasses.asdict(plan):
-            raise InstallerError("Resume manifest plan changed since preview; refusing to continue")
+        saved_plan = manifest.get("plan")
+        current_plan = dataclasses.asdict(plan)
+        if manifest.get("tool") != APP or not isinstance(saved_plan, dict):
+            raise InstallerError("Resume manifest identity or plan is invalid")
+        if saved_plan != current_plan:
+            without_name = dict(current_plan)
+            without_name["vm_name"] = saved_plan.get("vm_name")
+            if not args.vm_name or saved_plan != without_name:
+                raise InstallerError("Resume manifest plan changed since validation; refusing to continue")
+            manifest["plan"] = current_plan
+            update_manifest(manifest_path, manifest)
         parent = "/".join(plan.zvol.split("/")[:-1])
         expected_zvol = {"type":"zvol","id":plan.zvol,"dev":f"/dev/zvol/{plan.zvol}"}
         resources = manifest.get("resources")

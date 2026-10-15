@@ -30,7 +30,8 @@ python3 haos_truenas_installer.py --preview
 
 - Checks TrueNAS version and required VM/storage/network API methods.
 - Lists healthy pools and existing VM network attachment choices.
-- Lets you choose storage pool, existing interface/bridge, VM name and resources.
+- Uses alphanumeric-only VM names as required by the TrueNAS VM API.
+- Lets you choose storage pool, existing interface/bridge and VM resources.
 - Defaults to:
   - 2 CPU cores
   - 4096 MiB RAM
@@ -132,7 +133,7 @@ For disposable tests, use:
 
 ```sh
 python3 haos_truenas_installer.py \
-  --vm-name haos_installer_test_$(date +%Y%m%d_%H%M%S) \
+  --vm-name haosinstallertest$(date +%Y%m%d%H%M%S) \
   --disk-gib 32 \
   --ram-mib 2048 \
   --vcpus 2 \
@@ -144,7 +145,7 @@ Use a unique name. Keep the manifest. For long-term recovery, set `--manifest` t
 
 ## Recovery from interrupted installation
 
-For a partial install that has only the manifest-owned parent dataset and zvol, run the pinned installer from a root TrueNAS shell with `--resume-manifest /path/to/manifest.json`. It validates the manifest, pool, network, zvol size, and absence of an existing VM, then requires typing `RESUME`. Resume never creates or overwrites the zvol; it writes only to that exact manifest-owned zvol and proceeds to create the VM/devices. Use `--preview --resume-manifest ...` first to check the saved plan without writes.
+For a partial install that has only the manifest-owned parent dataset and zvol, run the pinned installer from a root TrueNAS shell with `--resume-manifest /path/to/manifest.json`. It validates the manifest, pool, network, zvol size, and absence of an existing VM, then requires typing `RESUME`. Resume never creates or overwrites the zvol; it writes only to that exact manifest-owned zvol and proceeds to create the VM/devices. Use `--vm-name NewAlphanumericName` on resume if the saved VM name is invalid for the TrueNAS API; this changes the pending VM name, not the zvol. Use `--preview --resume-manifest ...` first to check the saved plan without writes.
 
 1. Open the manifest written by the installer, for example:
 
