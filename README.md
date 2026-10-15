@@ -47,7 +47,8 @@ python3 haos_truenas_installer.py --preview
   - VM disk and NIC devices
 - Uses UEFI with `OVMF_CODE.fd` so Secure Boot is disabled.
 - Starts the VM unless `--no-start` is passed.
-- Writes a task manifest listing every created resource.
+- Writes a task manifest listing every created resource before the first TrueNAS change. The default is `/tmp/haos-installer-<vm-name>-manifest.json`; pass `--manifest` for another writable location.
+- Uses restrictive permissions and atomic updates for the manifest.
 
 ## What it refuses to do
 
@@ -139,14 +140,14 @@ python3 haos_truenas_installer.py \
   --no-start
 ```
 
-Use a unique name. Keep the manifest. Clean up only resources positively identified in that manifest.
+Use a unique name. Keep the manifest. For long-term recovery, set `--manifest` to a writable persistent path or copy the default manifest out of `/tmp` after installation. Clean up only resources positively identified in that manifest.
 
 ## Recovery from interrupted installation
 
 1. Open the manifest written by the installer, for example:
 
    ```sh
-   cat ./haos-installer-HAOS-manifest.json
+   cat /tmp/haos-installer-HAOS-manifest.json
    ```
 
 2. Confirm each resource ID/path belongs to the interrupted test/install.

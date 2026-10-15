@@ -28,6 +28,27 @@ class MidcltParsingTests(unittest.TestCase):
                 self.client().call("system.info")
 
 
+class ManifestPathTests(unittest.TestCase):
+    def test_default_manifest_uses_writable_tmp_location(self):
+        path = installer.resolve_manifest_path(None, "haos-test")
+        self.assertEqual(path, pathlib.Path("/tmp/haos-installer-haos-test-manifest.json"))
+
+    def test_explicit_manifest_path_is_respected(self):
+        with tempfile.TemporaryDirectory() as d:
+            requested = pathlib.Path(d) / "persistent" / "manifest.json"
+            self.assertEqual(installer.resolve_manifest_path(str(requested), "haos-test"), requested.resolve())
+
+    def test_manifest_permission_error_is_actionable_and_aborts_before_download(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
+        args = installer.parse_args(["--vm-name", "haos-test"])
+        with mock.patch.object(installer, "require_tools_for_install"):
+            with mock.patch.object(installer.os, "open", side_effect=PermissionError):
+                with mock.patch.object(installer, "download_and_verify") as download:
+                    with self.assertRaisesRegex(installer.InstallerError, "writable location"):
+                        installer.install(object(), plan, args)
+                    download.assert_not_called()
+
+
 class LauncherTests(unittest.TestCase):
     def test_launcher_passes_interactive_input_from_controlling_tty(self):
         text = (ROOT / "install.sh").read_text()

@@ -394,13 +394,20 @@ def run_checked(cmd: list[str], **kwargs):
     print(f"Running: {printable}")
     subprocess.run(cmd, check=True, **kwargs)
 
+def resolve_manifest_path(manifest_arg: str|None, vm_name: str) -> Path:
+    if manifest_arg:
+        return Path(manifest_arg).expanduser().resolve()
+    return Path("/tmp") / f"haos-installer-{vm_name}-manifest.json"
+
 def create_manifest(path: Path, plan: Plan) -> dict:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = {"tool": APP, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "resources": [], "plan": dataclasses.asdict(plan)}
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = {"tool": APP, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "resources": [], "plan": dataclasses.asdict(plan)}
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
         raise InstallerError(f"Task manifest already exists at {path}; choose a new manifest path") from exc
+    except PermissionError as exc:
+        raise InstallerError(f"Cannot write task manifest to {path}; use --manifest with a writable location") from exc
     with os.fdopen(fd, "w") as f:
         f.write(json.dumps(manifest, indent=2))
         f.flush()
@@ -421,6 +428,9 @@ def update_manifest(path: Path, manifest: dict):
 
 def install(client, plan: Plan, args):
     require_tools_for_install(False)
+    manifest_path = resolve_manifest_path(args.manifest, plan.vm_name)
+    manifest = create_manifest(manifest_path, plan)
+    print(f"Task manifest: {manifest_path}")
     cache_dir = Path(args.cache_dir).expanduser()
     image = download_and_verify(
         plan.image_url,
@@ -429,14 +439,11 @@ def install(client, plan: Plan, args):
         max_bytes=min(MAX_DOWNLOAD_BYTES_DEFAULT, args.max_download_gib * 1024**3),
         expected_size=plan.image_size or None,
     )
-    manifest_path = Path(args.manifest or f"./haos-installer-{plan.vm_name}-manifest.json").resolve()
     parent = "/".join(plan.zvol.split("/")[:-1])
     dev = f"/dev/zvol/{plan.zvol}"
     # Download, checksum, decompression, and QCOW2 validation all happen before
     # creating any TrueNAS datasets, zvols, VMs, or devices.
     with prepared_qcow_image(image, cache_dir, plan.disk_gib) as qcow:
-        manifest = create_manifest(manifest_path, plan)
-        print(f"Task manifest: {manifest_path}")
         parent_matches = client.call("pool.dataset.query", [[["id","=",parent]]])
         if parent_matches:
             if any(d.get("type") != "FILESYSTEM" for d in parent_matches):
@@ -519,7 +526,7 @@ def parse_args(argv=None):
     ap.add_argument("--yes", action="store_true", help="Proceed without final interactive confirmation")
     ap.add_argument("--allow-unsupported-version", action="store_true", help="Allow unsupported versions in read-only preview only; live installs stay blocked.")
     ap.add_argument("--cache-dir", default="/tmp/haos-truenas-installer-cache")
-    ap.add_argument("--manifest")
+    ap.add_argument("--manifest", help="Task manifest path (default: /tmp/haos-installer-<vm-name>-manifest.json)")
     ap.add_argument("--max-download-gib", type=int, default=10)
     ap.add_argument("--lock-file", default="/tmp/haos-truenas-installer.lock")
     return ap.parse_args(argv)
