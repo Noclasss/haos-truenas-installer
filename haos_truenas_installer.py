@@ -88,7 +88,14 @@ class MidcltClient:
         out = proc.stdout.strip()
         if out == "":
             return None
-        return json.loads(out)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError as exc:
+            # midclt emits the system.version scalar without JSON quotes on some
+            # TrueNAS builds; accept only that recognizable plain-text value.
+            if method == "system.version" and re.fullmatch(r"TrueNAS-[A-Za-z0-9._+-]+", out):
+                return out
+            raise InstallerError(f"TrueNAS midclt {method} returned invalid JSON output") from exc
 
 class TrueNASClient:
     def __init__(self, url: str, username: str|None, password: str|None, api_key: str|None, timeout: int = 60):

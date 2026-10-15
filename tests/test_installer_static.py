@@ -11,6 +11,23 @@ installer = importlib.util.module_from_spec(SPEC)
 sys.modules["installer"] = installer
 SPEC.loader.exec_module(installer)
 
+class MidcltParsingTests(unittest.TestCase):
+    def client(self):
+        with mock.patch.object(installer.shutil, "which", return_value="/usr/bin/midclt"):
+            return installer.MidcltClient()
+
+    def test_accepts_bare_system_version_scalar(self):
+        proc = installer.subprocess.CompletedProcess([], 0, stdout="TrueNAS-26.0.0-BETA.2", stderr="")
+        with mock.patch.object(installer.subprocess, "run", return_value=proc):
+            self.assertEqual(self.client().call("system.version"), "TrueNAS-26.0.0-BETA.2")
+
+    def test_rejects_non_json_from_other_methods_cleanly(self):
+        proc = installer.subprocess.CompletedProcess([], 0, stdout="not-json", stderr="")
+        with mock.patch.object(installer.subprocess, "run", return_value=proc):
+            with self.assertRaisesRegex(installer.InstallerError, "invalid JSON output"):
+                self.client().call("system.info")
+
+
 class StaticSafetyTests(unittest.TestCase):
     def test_version_gate(self):
         self.assertTrue(installer.version_supported("TrueNAS-25.10.0"))
