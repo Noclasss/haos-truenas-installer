@@ -78,6 +78,8 @@ Current BETA gates:
 
 The 26.0.0-BETA adapter was checked against a live read-only API schema from `TrueNAS-26.0.0-BETA.2`. Testing one release does **not** validate other TrueNAS releases.
 
+One user-reported full install and HAOS onboarding completed on `TrueNAS-26.0.0-BETA.2`; see `docs/compatibility.md`. This is a single-version validation, not a compatibility claim for other 26.0 builds.
+
 The installer verifies at runtime that these methods exist:
 
 - `vm.create`
