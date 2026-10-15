@@ -18,14 +18,14 @@ A version may be added only after:
   - Read-only discovery performed against live API schema.
   - Required VM/storage/network methods were present.
   - Existing resources were inventoried privately and not published.
-  - No live VM creation was performed during repository publication.
+  - On 2026-10-15, a user-reported full live install and completed HAOS onboarding succeeded with the official Home Assistant OS 18.3 image using installer code commit `7494d9711f1656fbf88bbe3f7a2801cac50046e7`.
+  - The disposable test VM and installer-created storage were removed after validation; unrelated VMs and devices were preserved.
+  - This is a single-environment validation, not a claim for other TrueNAS releases.
 
 ## Not yet proven
 
-- Full live HAOS install on 25.10.x.
-- Full live HAOS install on 26.0.0-BETA.x.
-- HAOS onboarding endpoint response from a newly created VM.
-- Other TrueNAS releases.
+- Full live HAOS install on `TrueNAS-25.10.x`.
+- Other 26.0.0-BETA.x builds, stable releases, and other TrueNAS versions.
 
 ## Official image source
 
@@ -33,4 +33,4 @@ The installer selects the latest non-draft, non-prerelease Home Assistant OS rel
 
 - <https://github.com/home-assistant/operating-system/releases>
 
-It selects the `haos_ova-<version>.qcow2.xz` asset and verifies the SHA-256 digest reported by GitHub's release asset API before converting the image.
+It selects the `haos_ova-<version>.qcow2.xz` asset and compares the downloaded image against the SHA-256 digest and expected size reported by GitHub's release asset API before converting the image. Because GitHub supplies both the artifact and digest, this detects corruption or mismatch but is not an independent signature.
