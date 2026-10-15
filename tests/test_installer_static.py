@@ -71,6 +71,25 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('else\n    python3 "$SRC/haos_truenas_installer.py" "$@"', text)
 
 
+class StorageSelectionTests(unittest.TestCase):
+    def test_pool_choice_requires_explicit_selection_and_shows_capacity(self):
+        pools=[{"name":"bulk","free":900*1024**3,"size":1000*1024**3},{"name":"apps","free":100*1024**3,"size":200*1024**3}]
+        with mock.patch.object(installer,"ask",return_value="2") as ask:
+            self.assertEqual(installer.select_storage_pool(pools),"apps")
+        ask.assert_called_once_with("Choose destination pool number","")
+
+    def test_disk_size_selector_offers_preset_and_custom_values(self):
+        with mock.patch.object(installer,"ask",return_value="3"):
+            self.assertEqual(installer.select_disk_size(),128)
+        with mock.patch.object(installer,"ask",side_effect=["5","384"]):
+            self.assertEqual(installer.select_disk_size(),384)
+
+    def test_test_limits_fix_interactive_disk_size_at_32_gib(self):
+        with mock.patch.object(installer,"ask") as ask:
+            self.assertEqual(installer.select_disk_size(test_limits=True),32)
+        ask.assert_not_called()
+
+
 class StaticSafetyTests(unittest.TestCase):
     def test_version_gate(self):
         self.assertTrue(installer.version_supported("TrueNAS-25.10.0"))

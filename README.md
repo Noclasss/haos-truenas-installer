@@ -31,7 +31,10 @@ python3 haos_truenas_installer.py --preview
 - Checks TrueNAS version and required VM/storage/network API methods.
 - Lists healthy pools and existing VM network attachment choices.
 - Uses alphanumeric-only VM names as required by the TrueNAS VM API.
-- Lets you choose storage pool, existing interface/bridge and VM resources.
+- Requires an explicit healthy storage-pool selection when `--pool` is not supplied; it displays each pool's free and total capacity and never chooses by emptiest-pool ranking.
+- Offers virtual disk sizes of 32, 64, 128 or 256 GiB, plus a custom size; `--disk-gib` bypasses the menu.
+- The selected disk size sets the HAOS VM's zvol capacity; it does not select or repartition a physical drive.
+- Lets you choose an existing interface/bridge and VM resources.
 - Defaults to:
   - 2 CPU cores
   - 4096 MiB RAM

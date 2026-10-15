@@ -221,6 +221,49 @@ def select_from(label: str, items: list[str], default: str|None=None) -> str:
         except Exception:
             print("Enter a listed number.")
 
+def select_storage_pool(pools: list[dict]) -> str:
+    if not pools:
+        raise InstallerError("No healthy ONLINE pools are available")
+    print("\nSelect the destination storage pool. No pool will be chosen automatically:")
+    for idx, pool in enumerate(pools, 1):
+        free = int(pool.get("free") or 0)
+        size = int(pool.get("size") or 0)
+        pct = free / size * 100 if size else 0
+        print(f"  {idx}. {pool['name']} — {free / 1024**3:.0f} GiB free of {size / 1024**3:.0f} GiB ({pct:.1f}% free)")
+    while True:
+        raw = ask("Choose destination pool number", "")
+        try:
+            index = int(raw) - 1
+            if 0 <= index < len(pools):
+                return pools[index]["name"]
+        except ValueError:
+            pass
+        print("Enter one of the listed pool numbers.")
+
+def select_disk_size(default_gib: int = 64, test_limits: bool = False) -> int:
+    if test_limits:
+        print("Test limits are active: the VM disk size is fixed at 32 GiB.")
+        return TEST_LIMITS["disk_gib"]
+    sizes = [32, 64, 128, 256]
+    print("\nChoose the HAOS virtual disk/zvol capacity (this does not select or repartition a physical drive):")
+    for idx, size in enumerate(sizes, 1):
+        suffix = " (recommended default)" if size == default_gib else (" (minimum)" if size == 32 else "")
+        print(f"  {idx}. {size} GiB{suffix}")
+    custom_index = len(sizes) + 1
+    print(f"  {custom_index}. Custom size")
+    default_index = sizes.index(default_gib) + 1 if default_gib in sizes else custom_index
+    while True:
+        raw = ask("Choose virtual disk size", str(default_index))
+        try:
+            choice = int(raw)
+        except ValueError:
+            choice = 0
+        if 1 <= choice <= len(sizes):
+            return sizes[choice - 1]
+        if choice == custom_index:
+            return ask_int("Custom disk size GiB", default_gib, 32)
+        print("Enter one of the listed disk-size choices.")
+
 def build_resume_plan(client, args, info: dict, version: str, required: list[str]) -> tuple[Plan, dict]:
     if args.manifest:
         raise InstallerError("Use only --resume-manifest when resuming; --manifest cannot be combined")
@@ -319,8 +362,10 @@ def build_plan(client, args) -> tuple[Plan, dict]:
         raise InstallerError("No healthy ONLINE pools found")
     print("\nHealthy pools:")
     for p in healthy: print(" - " + summarize_pool(p))
-    pool_name = args.pool or select_from("storage pool", [p["name"] for p in healthy], healthy[0]["name"])
-    pool = next(p for p in healthy if p["name"] == pool_name)
+    pool_name = args.pool or select_storage_pool(healthy)
+    pool = next((p for p in healthy if p["name"] == pool_name), None)
+    if pool is None:
+        raise InstallerError(f"Pool {pool_name!r} is not healthy and ONLINE; choose one of the listed pools")
     nic_choices = client.call("vm.device.nic_attach_choices")
     nics = (nic_choices.get("BRIDGE") or []) + (nic_choices.get("MACVLAN") or [])
     if not nics: raise InstallerError("No existing VM NIC attachment choices found. Refusing to alter host networking.")
@@ -328,7 +373,7 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     vm_name = validate_vm_name(args.vm_name or ask("VM name", DEFAULTS["vm_name"]))
     vcpus = args.vcpus if args.vcpus is not None else ask_int("CPU cores", DEFAULTS["vcpus"], 2, 16)
     ram_mib = args.ram_mib if args.ram_mib is not None else ask_int("RAM MiB", DEFAULTS["ram_mib"], 2048)
-    disk_gib = args.disk_gib if args.disk_gib is not None else ask_int("Disk GiB", DEFAULTS["disk_gib"], 32)
+    disk_gib = args.disk_gib if args.disk_gib is not None else select_disk_size(DEFAULTS["disk_gib"], args.test_limits)
     if args.test_limits:
         vcpus, ram_mib, disk_gib = min(vcpus,2), min(ram_mib,2048), min(disk_gib,32)
     if not 2 <= vcpus <= 16:
