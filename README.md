@@ -9,13 +9,13 @@ This project is for community users who want a one-command, guided HAOS install 
 Pinned to a commit is safest. Replace `<commit>` with a published commit SHA from this repository. Preview mode may be run from `main`, but live installs intentionally refuse an unpinned `main` launcher unless you set `HAOS_TRUENAS_ALLOW_UNPINNED=1`.
 
 ```sh
-HAOS_TRUENAS_INSTALLER_REF=<commit> curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sh -s -- --preview
+curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | HAOS_TRUENAS_INSTALLER_REF=<commit> sh -s -- --preview
 ```
 
 When the preview looks correct, run without `--preview`:
 
 ```sh
-HAOS_TRUENAS_INSTALLER_REF=<commit> curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | HAOS_TRUENAS_INSTALLER_REF=<commit> sh
 ```
 
 You can also set `HAOS_TRUENAS_INSTALLER_REF=<commit>` when using the launcher from a branch copy of `install.sh`.
@@ -36,7 +36,9 @@ python3 haos_truenas_installer.py --preview
   - 4096 MiB RAM
   - 64 GiB disk
 - Downloads the latest stable official Home Assistant OS KVM/OVA QCOW2 image from the Home Assistant OS GitHub releases.
-- Verifies the GitHub release asset SHA-256 digest before writing anything to the new VM disk.
+- Verifies the GitHub release asset SHA-256 digest and enforces a configured maximum download size before writing any TrueNAS resources.
+- Decompresses to a temporary seekable QCOW2 file and validates its format, backing-file status, and virtual size before creating datasets or a zvol; the temporary image is removed automatically.
+- Preflights XZ expansion size before decompressing, requires the cache filesystem to have the expanded size plus a 1 GiB reserve free, and rejects expanded artifacts larger than the target VM disk plus 256 MiB.
 - Creates only new resources:
   - parent dataset, if needed: `<pool>/haos-vms`
   - zvol: `<pool>/haos-vms/<vm-name>`
@@ -70,8 +72,12 @@ The installer verifies at runtime that these methods exist:
 - `vm.create`
 - `vm.start`
 - `vm.query`
+- `vm.stop`
 - `vm.device.create`
+- `vm.device.delete`
+- `vm.device.query`
 - `vm.device.nic_attach_choices`
+- `interface.query`
 - `pool.dataset.create`
 - `pool.dataset.query`
 - `pool.query`

@@ -211,12 +211,13 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     info = client.call("system.info")
     version = client.call("system.version")
     methods = client.call("core.get_methods")
-    required = ["vm.create", "vm.start", "vm.query", "vm.device.create", "vm.device.nic_attach_choices", "pool.dataset.create", "pool.dataset.query", "pool.query"]
+    required = ["vm.create", "vm.start", "vm.stop", "vm.query", "vm.device.create", "vm.device.delete", "vm.device.query", "vm.device.nic_attach_choices", "pool.dataset.create", "pool.dataset.query", "pool.query", "interface.query"]
     missing = [m for m in required if m not in methods]
     if missing:
         raise InstallerError("Required TrueNAS VM/storage API methods are missing: " + ", ".join(missing))
-    if not version_supported(version) and not args.allow_unsupported_version:
-        raise InstallerError(f"Unsupported TrueNAS version {version}. This BETA supports 25.10.x and 26.0.0-BETA.x adapters only. Use --allow-unsupported-version only for preview/mocked evaluation, not a real install.")
+    if not version_supported(version):
+        if not args.preview or not args.allow_unsupported_version:
+            raise InstallerError(f"Unsupported TrueNAS version {version}. This BETA supports 25.10.x and 26.0.0-BETA.x. Unsupported versions may only be evaluated in read-only preview mode with --allow-unsupported-version; live installs remain blocked.")
     pools = client.call("pool.query")
     healthy = [p for p in pools if p.get("healthy") and p.get("status") == "ONLINE"]
     if not healthy:
@@ -230,11 +231,19 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     if not nics: raise InstallerError("No existing VM NIC attachment choices found. Refusing to alter host networking.")
     nic = args.nic or select_from("existing network attachment", nics, "br0" if "br0" in nics else ("br01" if "br01" in nics else nics[0]))
     vm_name = validate_name(args.vm_name or ask("VM name", DEFAULTS["vm_name"]), "VM")
-    vcpus = args.vcpus or ask_int("CPU cores", DEFAULTS["vcpus"], 1, 16)
-    ram_mib = args.ram_mib or ask_int("RAM MiB", DEFAULTS["ram_mib"], 1024)
-    disk_gib = args.disk_gib or ask_int("Disk GiB", DEFAULTS["disk_gib"], 16)
+    vcpus = args.vcpus if args.vcpus is not None else ask_int("CPU cores", DEFAULTS["vcpus"], 1, 16)
+    ram_mib = args.ram_mib if args.ram_mib is not None else ask_int("RAM MiB", DEFAULTS["ram_mib"], 1024)
+    disk_gib = args.disk_gib if args.disk_gib is not None else ask_int("Disk GiB", DEFAULTS["disk_gib"], 16)
     if args.test_limits:
         vcpus, ram_mib, disk_gib = min(vcpus,2), min(ram_mib,2048), min(disk_gib,32)
+    if not 1 <= vcpus <= 16:
+        raise InstallerError("CPU cores must be between 1 and 16")
+    if ram_mib < 1024:
+        raise InstallerError("RAM must be at least 1024 MiB")
+    if disk_gib < 16:
+        raise InstallerError("Disk size must be at least 16 GiB")
+    if not 1 <= args.max_download_gib <= 10:
+        raise InstallerError("Maximum download size must be between 1 and 10 GiB")
     existing_vms = client.call("vm.query")
     if any(v.get("name") == vm_name for v in existing_vms):
         raise InstallerError(f"A VM named {vm_name!r} already exists; refusing to overwrite")
@@ -264,21 +273,112 @@ def print_plan(plan: Plan, meta: dict):
     print("  Firmware: UEFI, OVMF_CODE.fd, Secure Boot disabled")
     print(f"  Start after creation: {plan.start_vm}")
 
-def download_and_verify(url: str, sha256: str, cache_dir: Path) -> Path:
+def download_and_verify(url: str, sha256: str, cache_dir: Path, max_bytes: int = MAX_DOWNLOAD_BYTES_DEFAULT, expected_size: int|None = None) -> Path:
+    if not url.startswith("https://"):
+        raise InstallerError("HAOS image downloads must use HTTPS")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
+        raise InstallerError("A valid 64-character SHA-256 is required for the HAOS image")
+    if max_bytes <= 0:
+        raise InstallerError("Download byte limit must be positive")
+    if expected_size is not None and not 0 <= expected_size <= max_bytes:
+        raise InstallerError(f"HAOS image asset size is outside the configured 0–{max_bytes} byte limit")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    dest = cache_dir / Path(urllib.parse.urlparse(url).path).name
+    dest = cache_dir / f"haos-{sha256.lower()}.qcow2.xz"
+    if dest.exists():
+        cached_hash = hashlib.sha256()
+        with open(dest, "rb") as cached_file:
+            for chunk in iter(lambda: cached_file.read(1024*1024), b""):
+                cached_hash.update(chunk)
+        if cached_hash.hexdigest().lower() == sha256.lower() and (expected_size is None or dest.stat().st_size == expected_size):
+            return dest
+        dest.unlink()
+    partial = None
+    partial_fd = None
     h = hashlib.sha256()
+    total = 0
     req = urllib.request.Request(url, headers={"User-Agent": APP})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
-        while True:
-            chunk = resp.read(1024*1024)
-            if not chunk: break
-            h.update(chunk); f.write(chunk)
-    got = h.hexdigest()
-    if got.lower() != sha256.lower():
-        dest.unlink(missing_ok=True)
-        raise InstallerError(f"Image checksum mismatch: expected {sha256}, got {got}")
-    return dest
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            header_size = resp.headers.get("Content-Length")
+            if header_size:
+                try:
+                    declared_size = int(header_size)
+                except (TypeError, ValueError) as exc:
+                    raise InstallerError("HAOS server returned an invalid Content-Length") from exc
+                if declared_size < 0 or declared_size > max_bytes:
+                    raise InstallerError(f"HAOS image exceeds the configured {max_bytes} byte download limit")
+                if expected_size is not None and declared_size != expected_size:
+                    raise InstallerError(f"HAOS image size mismatch: expected {expected_size} bytes, server declared {declared_size}")
+            partial_fd, partial_name = tempfile.mkstemp(prefix=dest.name + ".", suffix=".part", dir=cache_dir)
+            partial = Path(partial_name)
+            with os.fdopen(partial_fd, "wb") as f:
+                partial_fd = None
+                while True:
+                    chunk = resp.read(1024*1024)
+                    if not chunk: break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise InstallerError(f"HAOS image exceeded the configured {max_bytes} byte download limit")
+                    h.update(chunk); f.write(chunk)
+        if expected_size is not None and total != expected_size:
+            raise InstallerError(f"HAOS image size mismatch: expected {expected_size} bytes, got {total}")
+        got = h.hexdigest()
+        if got.lower() != sha256.lower():
+            raise InstallerError(f"Image checksum mismatch: expected {sha256}, got {got}")
+        os.replace(partial, dest)
+        return dest
+    finally:
+        if partial_fd is not None:
+            os.close(partial_fd)
+        if partial is not None:
+            partial.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def prepared_qcow_image(image: Path, cache_dir: Path, disk_gib: int):
+    """Yield a validated, seekable QCOW2 temp file, removing it on exit."""
+    listing = subprocess.run(["xz", "--robot", "--list", str(image)], check=True, capture_output=True, text=True)
+    file_rows = [line.split("\t") for line in listing.stdout.splitlines() if line.startswith("file\t")]
+    if len(file_rows) != 1 or len(file_rows[0]) < 5 or not file_rows[0][4].isdigit():
+        raise InstallerError("Cannot determine the compressed image's expanded size; refusing to decompress")
+    expanded_bytes = int(file_rows[0][4])
+    expanded_limit = disk_gib * 1024**3 + 256 * 1024**2
+    if expanded_bytes <= 0 or expanded_bytes > expanded_limit:
+        raise InstallerError(f"Expanded image size ({expanded_bytes} bytes) exceeds the safe limit for a {disk_gib} GiB VM disk")
+    free_bytes = os.statvfs(cache_dir).f_bavail * os.statvfs(cache_dir).f_frsize
+    if free_bytes < expanded_bytes + 1024**3:
+        raise InstallerError("Not enough free space in the image cache filesystem for safe decompression (including a 1 GiB reserve)")
+    fd, temp_name = tempfile.mkstemp(prefix="haos-", suffix=".qcow2", dir=cache_dir)
+    qcow = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            fd = -1
+            subprocess.run(["xz", "-dc", "--", str(image)], stdout=out, check=True)
+        if qcow.stat().st_size != expanded_bytes:
+            raise InstallerError("Expanded HAOS image size differs from the XZ metadata")
+        info_proc = subprocess.run(["qemu-img", "info", "--output=json", "-f", "qcow2", str(qcow)], check=True, capture_output=True, text=True)
+        try:
+            image_info = json.loads(info_proc.stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise InstallerError("qemu-img returned invalid QCOW2 image information") from exc
+        if image_info.get("format") != "qcow2":
+            raise InstallerError("Downloaded HAOS image is not QCOW2 format")
+        if image_info.get("backing-filename"):
+            raise InstallerError("Refusing QCOW2 images that depend on a backing file")
+        virtual_size = int(image_info.get("virtual-size") or 0)
+        if virtual_size <= 0:
+            raise InstallerError("QCOW2 image reports an invalid virtual size")
+        if virtual_size > disk_gib * 1024**3:
+            raise InstallerError(f"HAOS image needs {virtual_size/1024**3:.1f} GiB but the planned zvol is only {disk_gib} GiB")
+        yield qcow
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        qcow.unlink(missing_ok=True)
+
+
+def convert_qcow_to_zvol(qcow: Path, zvol_dev: str):
+    run_checked(["qemu-img", "convert", "-p", "-f", "qcow2", "-O", "raw", str(qcow), zvol_dev])
 
 def run_checked(cmd: list[str], **kwargs):
     printable = " ".join(cmd[:3]) + (" ..." if len(cmd)>3 else "")
@@ -286,35 +386,61 @@ def run_checked(cmd: list[str], **kwargs):
     subprocess.run(cmd, check=True, **kwargs)
 
 def create_manifest(path: Path, plan: Plan) -> dict:
+    path.parent.mkdir(parents=True, exist_ok=True)
     manifest = {"tool": APP, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "resources": [], "plan": dataclasses.asdict(plan)}
-    path.write_text(json.dumps(manifest, indent=2))
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise InstallerError(f"Task manifest already exists at {path}; choose a new manifest path") from exc
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(manifest, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
     return manifest
 
 def update_manifest(path: Path, manifest: dict):
-    path.write_text(json.dumps(manifest, indent=2))
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(manifest, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
 
 def install(client, plan: Plan, args):
     require_tools_for_install(False)
+    cache_dir = Path(args.cache_dir).expanduser()
+    image = download_and_verify(
+        plan.image_url,
+        plan.image_sha256,
+        cache_dir,
+        max_bytes=min(MAX_DOWNLOAD_BYTES_DEFAULT, args.max_download_gib * 1024**3),
+        expected_size=plan.image_size or None,
+    )
     manifest_path = Path(args.manifest or f"./haos-installer-{plan.vm_name}-manifest.json").resolve()
-    manifest = create_manifest(manifest_path, plan)
-    print(f"Task manifest: {manifest_path}")
     parent = "/".join(plan.zvol.split("/")[:-1])
-    # Create parent filesystem if absent; refuse if path collision later.
-    if not client.call("pool.dataset.query", [[["id","=",parent]]]):
-        client.call("pool.dataset.create", [{"name": parent, "type":"FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}])
-        manifest["resources"].append({"type":"dataset", "id":parent}); update_manifest(manifest_path, manifest)
-    client.call("pool.dataset.create", [{"name": plan.zvol, "type":"VOLUME", "volsize": plan.disk_gib * 1024**3, "comments": f"Created by {APP} for {plan.vm_name}"}])
-    manifest["resources"].append({"type":"zvol", "id":plan.zvol, "dev":f"/dev/zvol/{plan.zvol}"}); update_manifest(manifest_path, manifest)
-    image = download_and_verify(plan.image_url, plan.image_sha256, Path(args.cache_dir).expanduser())
     dev = f"/dev/zvol/{plan.zvol}"
-    if not Path(dev).exists():
-        raise InstallerError(f"Created zvol device path is not visible: {dev}")
-    # Safe conversion: source verified image, destination is exactly the newly created zvol in manifest.
-    with subprocess.Popen(["xz", "-dc", str(image)], stdout=subprocess.PIPE) as xz:
-        subprocess.run(["qemu-img", "convert", "-p", "-f", "qcow2", "-O", "raw", "/dev/stdin", dev], stdin=xz.stdout, check=True)
-        xz.wait()
-        if xz.returncode:
-            raise InstallerError("xz decompression failed")
+    # Download, checksum, decompression, and QCOW2 validation all happen before
+    # creating any TrueNAS datasets, zvols, VMs, or devices.
+    with prepared_qcow_image(image, cache_dir, plan.disk_gib) as qcow:
+        manifest = create_manifest(manifest_path, plan)
+        print(f"Task manifest: {manifest_path}")
+        parent_matches = client.call("pool.dataset.query", [[["id","=",parent]]])
+        if parent_matches:
+            if any(d.get("type") != "FILESYSTEM" for d in parent_matches):
+                raise InstallerError(f"Parent dataset {parent!r} exists but is not a filesystem; refusing to use it")
+        else:
+            client.call("pool.dataset.create", [{"name": parent, "type":"FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}])
+            manifest["resources"].append({"type":"dataset", "id":parent}); update_manifest(manifest_path, manifest)
+        client.call("pool.dataset.create", [{"name": plan.zvol, "type":"VOLUME", "volsize": plan.disk_gib * 1024**3, "comments": f"Created by {APP} for {plan.vm_name}"}])
+        manifest["resources"].append({"type":"zvol", "id":plan.zvol, "dev":dev}); update_manifest(manifest_path, manifest)
+        if not Path(dev).exists():
+            raise InstallerError(f"Created zvol device path is not visible: {dev}")
+        # Destination is only the newly created zvol recorded in the manifest.
+        convert_qcow_to_zvol(qcow, dev)
     vm = client.call("vm.create", [{
         "name": plan.vm_name,
         "description": f"Home Assistant OS VM created by {APP} (BETA)",
@@ -378,7 +504,7 @@ def parse_args(argv=None):
     ap.add_argument("--image-sha256")
     ap.add_argument("--no-start", action="store_true")
     ap.add_argument("--yes", action="store_true", help="Proceed without final interactive confirmation")
-    ap.add_argument("--allow-unsupported-version", action="store_true", help="Bypass version gate. Not recommended for live installs.")
+    ap.add_argument("--allow-unsupported-version", action="store_true", help="Allow unsupported versions in read-only preview only; live installs stay blocked.")
     ap.add_argument("--cache-dir", default="/tmp/haos-truenas-installer-cache")
     ap.add_argument("--manifest")
     ap.add_argument("--max-download-gib", type=int, default=10)
