@@ -219,8 +219,12 @@ class PlanTests(unittest.TestCase):
         plan, _ = installer.build_plan(client, args)
         self.assertTrue(plan.preview)
         self.assertEqual(plan.true_version, "TrueNAS-27.0.0-BETA.1")
+    def test_minimum_supported_resources_accepted(self):
+        client = self.base_client()
+        plan, _ = installer.build_plan(client, self.args(vcpus=2, ram_mib=2048, disk_gib=32))
+        self.assertEqual((plan.vcpus, plan.ram_mib, plan.disk_gib), (2, 2048, 32))
     def test_invalid_cli_resource_values_refused(self):
-        for changes in ({"vcpus": -1}, {"ram_mib": 0}, {"disk_gib": -8}, {"max_download_gib": 0}):
+        for changes in ({"vcpus": 1}, {"ram_mib": 2047}, {"disk_gib": 31}, {"max_download_gib": 0}):
             client = self.base_client()
             with self.subTest(changes=changes), self.assertRaises(installer.InstallerError):
                 installer.build_plan(client, self.args(**changes))

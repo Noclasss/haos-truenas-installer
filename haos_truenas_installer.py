@@ -156,8 +156,10 @@ def ask_int(prompt: str, default: int, min_value: int, max_value: int|None=None)
         try: value = int(raw)
         except ValueError:
             print("Enter a whole number."); continue
-        if value < min_value or (max_value is not None and value > max_value):
-            print(f"Enter a value between {min_value} and {max_value}."); continue
+        if value < min_value:
+            print(f"Enter a value of at least {min_value}."); continue
+        if max_value is not None and value > max_value:
+            print(f"Enter a value no greater than {max_value}."); continue
         return value
 
 def validate_name(name: str, what: str) -> str:
@@ -238,17 +240,17 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     if not nics: raise InstallerError("No existing VM NIC attachment choices found. Refusing to alter host networking.")
     nic = args.nic or select_from("existing network attachment", nics, "br0" if "br0" in nics else ("br01" if "br01" in nics else nics[0]))
     vm_name = validate_name(args.vm_name or ask("VM name", DEFAULTS["vm_name"]), "VM")
-    vcpus = args.vcpus if args.vcpus is not None else ask_int("CPU cores", DEFAULTS["vcpus"], 1, 16)
-    ram_mib = args.ram_mib if args.ram_mib is not None else ask_int("RAM MiB", DEFAULTS["ram_mib"], 1024)
-    disk_gib = args.disk_gib if args.disk_gib is not None else ask_int("Disk GiB", DEFAULTS["disk_gib"], 16)
+    vcpus = args.vcpus if args.vcpus is not None else ask_int("CPU cores", DEFAULTS["vcpus"], 2, 16)
+    ram_mib = args.ram_mib if args.ram_mib is not None else ask_int("RAM MiB", DEFAULTS["ram_mib"], 2048)
+    disk_gib = args.disk_gib if args.disk_gib is not None else ask_int("Disk GiB", DEFAULTS["disk_gib"], 32)
     if args.test_limits:
         vcpus, ram_mib, disk_gib = min(vcpus,2), min(ram_mib,2048), min(disk_gib,32)
-    if not 1 <= vcpus <= 16:
-        raise InstallerError("CPU cores must be between 1 and 16")
-    if ram_mib < 1024:
-        raise InstallerError("RAM must be at least 1024 MiB")
-    if disk_gib < 16:
-        raise InstallerError("Disk size must be at least 16 GiB")
+    if not 2 <= vcpus <= 16:
+        raise InstallerError("CPU cores must be between 2 and 16")
+    if ram_mib < 2048:
+        raise InstallerError("RAM must be at least 2048 MiB")
+    if disk_gib < 32:
+        raise InstallerError("Disk size must be at least 32 GiB")
     if not 1 <= args.max_download_gib <= 10:
         raise InstallerError("Maximum download size must be between 1 and 10 GiB")
     existing_vms = client.call("vm.query")

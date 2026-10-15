@@ -35,6 +35,7 @@ python3 haos_truenas_installer.py --preview
   - 2 CPU cores
   - 4096 MiB RAM
   - 64 GiB disk
+- Enforces minimum resources of 2 CPU cores, 2048 MiB RAM and 32 GiB disk.
 - Downloads the latest stable official Home Assistant OS KVM/OVA QCOW2 image from the Home Assistant OS GitHub releases.
 - Verifies the GitHub release asset SHA-256 digest and enforces a configured maximum download size before writing any TrueNAS resources.
 - Decompresses to a temporary seekable QCOW2 file and validates its format, backing-file status, and virtual size before creating datasets or a zvol; the temporary image is removed automatically.
