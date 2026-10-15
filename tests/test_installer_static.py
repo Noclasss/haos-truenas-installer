@@ -387,6 +387,18 @@ class ReleaseMetadataTests(unittest.TestCase):
 
 
 class DownloadSafetyTests(unittest.TestCase):
+    def test_default_cache_is_scoped_to_effective_user(self):
+        args = installer.parse_args([])
+        self.assertEqual(args.cache_dir, f"/tmp/haos-truenas-installer-cache-{installer.os.geteuid()}")
+
+    def test_cache_rejects_foreign_owned_directory_with_actionable_message(self):
+        actual_uid = installer.os.geteuid()
+        with tempfile.TemporaryDirectory() as d:
+            cache = pathlib.Path(d) / "cache"; cache.mkdir()
+            with mock.patch.object(installer.os, "geteuid", return_value=actual_uid + 1):
+                with self.assertRaisesRegex(installer.InstallerError, "choose a new --cache-dir"):
+                    installer.ensure_private_cache_dir(cache)
+
     class Response:
         def __init__(self, chunks, headers=None, url="https://example.test/image.xz"):
             self.chunks = iter(chunks)

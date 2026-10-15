@@ -513,7 +513,7 @@ def ensure_private_cache_dir(cache_dir: Path) -> Path:
         cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = cache_dir.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-            raise InstallerError("Image cache directory must be a real directory owned by the current user")
+            raise InstallerError("Image cache directory must be a real directory owned by the current user; choose a new --cache-dir rather than reusing another user's cache")
         os.chmod(cache_dir, 0o700)
     except OSError as exc:
         raise InstallerError("Could not create a private image cache directory") from exc
@@ -842,7 +842,7 @@ def parse_args(argv=None):
     ap.add_argument("--no-start", action="store_true")
     ap.add_argument("--yes", action="store_true", help="Proceed without final interactive confirmation")
     ap.add_argument("--allow-unsupported-version", action="store_true", help="Allow unsupported versions in read-only preview only; live installs stay blocked.")
-    ap.add_argument("--cache-dir", default="/tmp/haos-truenas-installer-cache")
+    ap.add_argument("--cache-dir", default=f"/tmp/haos-truenas-installer-cache-{os.geteuid()}")
     ap.add_argument("--manifest", help="Task manifest path (default: /tmp/haos-installer-<vm-name>-manifest.json)")
     ap.add_argument("--resume-manifest", help="Resume only an incomplete install whose exact resources are recorded in this manifest")
     ap.add_argument("--max-download-gib", type=int, default=10)
