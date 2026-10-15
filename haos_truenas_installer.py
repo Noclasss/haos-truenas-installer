@@ -220,6 +220,31 @@ def validate_vm_name(name: str) -> str:
         raise InstallerError("Invalid VM name. TrueNAS accepts only 1-63 ASCII letters and numbers for VM names.")
     return name
 
+def ensure_trusted_directory_chain(directory: Path, purpose: str, create: bool = False) -> Path:
+    """Reject symlinks and directory ancestors an untrusted local user can change."""
+    directory = Path(os.path.abspath(os.fspath(directory)))
+    trusted_owners = {0, os.geteuid()}
+    chain = [*reversed(directory.parents), directory]
+    try:
+        for current in chain:
+            if create:
+                try:
+                    current.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
+            info = current.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise InstallerError(f"{purpose} path contains a symlink or non-directory component")
+            if info.st_uid not in trusted_owners:
+                raise InstallerError(f"{purpose} path contains a directory not owned by root or the current user")
+            if info.st_mode & 0o022 and not (info.st_mode & stat.S_ISVTX and info.st_uid in trusted_owners):
+                raise InstallerError(f"{purpose} path contains a group/world-writable directory without a trusted sticky bit")
+    except InstallerError:
+        raise
+    except OSError as exc:
+        raise InstallerError(f"Could not verify the {purpose.lower()} directory path") from exc
+    return directory
+
 def dataset_comment(dataset: dict) -> str:
     properties = dataset.get("user_properties") or {}
     comment = properties.get("comments", dataset.get("comments", ""))
@@ -463,6 +488,8 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     nics = (nic_choices.get("BRIDGE") or []) + (nic_choices.get("MACVLAN") or [])
     if not nics: raise InstallerError("No existing VM NIC attachment choices found. Refusing to alter host networking.")
     nic = args.nic or select_from("existing network attachment", nics, "br0" if "br0" in nics else ("br01" if "br01" in nics else nics[0]))
+    if nic not in nics:
+        raise InstallerError(f"Network attachment {nic!r} is not an existing TrueNAS VM attachment choice")
     vm_name = validate_vm_name(args.vm_name or ask("VM name", DEFAULTS["vm_name"]))
     vcpus = args.vcpus if args.vcpus is not None else ask_int("CPU cores", DEFAULTS["vcpus"], 2, 16)
     ram_mib = args.ram_mib if args.ram_mib is not None else ask_int("RAM MiB", DEFAULTS["ram_mib"], 2048)
@@ -508,13 +535,17 @@ def print_plan(plan: Plan, meta: dict):
     print(f"  Start after creation: {plan.start_vm}")
 
 def ensure_private_cache_dir(cache_dir: Path) -> Path:
-    cache_dir = Path(cache_dir).expanduser()
+    cache_dir = Path(os.path.abspath(os.fspath(Path(cache_dir).expanduser())))
     try:
-        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cache_dir = ensure_trusted_directory_chain(cache_dir, "Image cache", create=True)
         info = cache_dir.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
             raise InstallerError("Image cache directory must be a real directory owned by the current user; choose a new --cache-dir rather than reusing another user's cache")
+        if info.st_mode & 0o022:
+            raise InstallerError("Image cache directory must not be group/world-writable; choose a new --cache-dir")
         os.chmod(cache_dir, 0o700)
+    except InstallerError:
+        raise
     except OSError as exc:
         raise InstallerError("Could not create a private image cache directory") from exc
     return cache_dir
@@ -648,12 +679,16 @@ def resolve_manifest_path(manifest_arg: str|None, vm_name: str) -> Path:
     return Path("/tmp") / f"haos-installer-{vm_name}-manifest.json"
 
 def read_manifest_file(path: Path) -> dict:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    path = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    ensure_trusted_directory_chain(path.parent, "Task manifest")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(str(path), flags)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
             raise InstallerError("Resume manifest must be a regular file that is not group/world-writable")
+        if info.st_uid not in {0, os.geteuid()}:
+            raise InstallerError("Resume manifest must be owned by root or the current user")
         if info.st_size > 1024 * 1024:
             raise InstallerError("Resume manifest exceeds the 1 MiB safety limit")
         with os.fdopen(fd, "r") as source:
@@ -664,8 +699,9 @@ def read_manifest_file(path: Path) -> dict:
             os.close(fd)
 
 def create_manifest(path: Path, plan: Plan) -> dict:
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_trusted_directory_chain(path.parent, "Task manifest", create=True)
         manifest = {"tool": APP, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "resources": [], "plan": dataclasses.asdict(plan)}
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
@@ -679,6 +715,8 @@ def create_manifest(path: Path, plan: Plan) -> dict:
     return manifest
 
 def update_manifest(path: Path, manifest: dict):
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    ensure_trusted_directory_chain(path.parent, "Task manifest")
     fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as f:
@@ -723,7 +761,7 @@ def install(client, plan: Plan, args):
     else:
         manifest = create_manifest(manifest_path, plan)
     print(f"Task manifest: {manifest_path}")
-    cache_dir = Path(args.cache_dir).expanduser()
+    cache_dir = ensure_private_cache_dir(Path(args.cache_dir).expanduser())
     image = download_and_verify(
         plan.image_url,
         plan.image_sha256,
@@ -791,8 +829,8 @@ def install(client, plan: Plan, args):
     vm_id = vm["id"]
     manifest["resources"].append({"type":"vm", "id":vm_id, "name":plan.vm_name}); update_manifest(manifest_path, manifest)
     disk = client.call("vm.device.create", [{"vm": vm_id, "attributes":{"dtype":"DISK", "path":dev, "type":"VIRTIO", "create_zvol":False, "iotype":"THREADS"}}])
+    manifest["resources"].append({"type":"device", "id":disk["id"], "kind":"DISK"}); update_manifest(manifest_path, manifest)
     nic = client.call("vm.device.create", [{"vm": vm_id, "attributes":{"dtype":"NIC", "type":"VIRTIO", "nic_attach":plan.nic_attach, "mac": random_mac()}}])
-    manifest["resources"].append({"type":"device", "id":disk["id"], "kind":"DISK"})
     manifest["resources"].append({"type":"device", "id":nic["id"], "kind":"NIC"}); update_manifest(manifest_path, manifest)
     if plan.start_vm:
         client.call("vm.start", [vm_id, {"overcommit": False}])

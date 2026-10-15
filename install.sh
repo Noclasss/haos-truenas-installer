@@ -30,6 +30,30 @@ case "$TMPBASE" in
   /*) ;;
   *) TMPBASE=/tmp ;;
 esac
+TMPBASE=$(python3 - "$TMPBASE" <<'PY' || exit 1
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(os.path.abspath(sys.argv[1]))
+trusted_owners = {0, os.geteuid()}
+try:
+    for current in [*reversed(path.parents), path]:
+        info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in trusted_owners:
+            raise ValueError("not a trusted real directory")
+        if info.st_mode & 0o022 and not (info.st_mode & stat.S_ISVTX and info.st_uid in trusted_owners):
+            raise ValueError("directory is writable by other users")
+except (OSError, ValueError):
+    print("ERROR: TMPDIR must be a real directory owned by root/current user with trusted permissions.", file=sys.stderr)
+    raise SystemExit(1)
+print(path)
+PY
+) || {
+  printf '%s\n' "ERROR: refusing an unsafe temporary-directory path." >&2
+  exit 1
+}
 TMP=$(mktemp -d "$TMPBASE/haos-truenas-installer.XXXXXX") || {
   printf '%s\n' "ERROR: could not create a private temporary directory." >&2
   exit 1

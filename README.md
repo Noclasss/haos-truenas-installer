@@ -6,18 +6,18 @@ This project is for community users who want a one-command, guided HAOS install 
 
 ## One-command guided launcher
 
-The copy/paste commands below are pinned to the published installer commit `46274ea124954f62b686282e63df2bceb3dadde8`. For reproducible use, keep the same commit SHA in both the URL and `HAOS_TRUENAS_INSTALLER_REF`. When a newer installer commit is published, update both occurrences to that full SHA.
+The copy/paste commands below are pinned to the published installer commit `05a1a46cbf2d510a38d498cc3ecc300ae45e192a`. For reproducible use, keep the same commit SHA in both the URL and `HAOS_TRUENAS_INSTALLER_REF`. When a newer installer commit is published, update both occurrences to that full SHA.
 
 Run a read-only preview first:
 
 ```sh
-REF=46274ea124954f62b686282e63df2bceb3dadde8; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/install.sh" | HAOS_TRUENAS_INSTALLER_REF="$REF" sh -s -- --preview
+REF=05a1a46cbf2d510a38d498cc3ecc300ae45e192a; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/install.sh" | HAOS_TRUENAS_INSTALLER_REF="$REF" sh -s -- --preview
 ```
 
 When the preview looks right, paste this one-line guided install from a root shell, or keep `sudo` as shown:
 
 ```sh
-REF=46274ea124954f62b686282e63df2bceb3dadde8; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/install.sh" | sudo env HAOS_TRUENAS_INSTALLER_REF="$REF" sh -s -- --no-start
+REF=05a1a46cbf2d510a38d498cc3ecc300ae45e192a; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/install.sh" | sudo env HAOS_TRUENAS_INSTALLER_REF="$REF" sh -s -- --no-start
 ```
 
 The prompts let you choose the healthy storage pool, existing network attachment, VM name, CPU and RAM, and virtual disk size. The installer then displays the selected pool, zvol path and size, network, VM settings, and start behavior. Review that plan carefully; type `CREATE` only if it is correct. `--no-start` leaves the new VM powered off so you can start it yourself after creation. The pool menu chooses the TrueNAS storage pool for the VM disk; it does not select or repartition a physical drive.
@@ -46,7 +46,7 @@ python3 haos_truenas_installer.py --preview
 - Enforces minimum resources of 2 CPU cores, 2048 MiB RAM and 32 GiB disk.
 - Downloads the latest stable official Home Assistant OS KVM/OVA QCOW2 image from the Home Assistant OS GitHub releases.
 - Verifies the GitHub release asset SHA-256 digest and enforces a configured maximum download size before writing any TrueNAS resources.
-- Stores image downloads in a private cache directory scoped to the effective user (`/tmp/haos-truenas-installer-cache-<uid>` by default); an explicitly supplied cache directory must be owned by the installer process.
+- Stores image downloads in a private cache directory scoped to the effective user (`/tmp/haos-truenas-installer-cache-<uid>` by default); the cache and its parent path must be trusted, and the final directory must be owned by the installer process.
 - Decompresses to a temporary seekable QCOW2 file and validates its format, backing-file status, and virtual size before creating datasets or a zvol; the temporary image is removed automatically.
 - Preflights XZ expansion size before decompressing, requires the cache filesystem to have the expanded size plus a 1 GiB reserve free, and rejects expanded artifacts larger than the target VM disk plus 256 MiB.
 - Creates only new resources:
@@ -56,8 +56,8 @@ python3 haos_truenas_installer.py --preview
   - VM disk and NIC devices
 - Uses UEFI with `OVMF_CODE.fd` so Secure Boot is disabled.
 - Starts the VM unless `--no-start` is passed.
-- Writes a task manifest listing every created resource before the first TrueNAS change. The default is `/tmp/haos-installer-<vm-name>-manifest.json`; pass `--manifest` for another writable location.
-- Uses restrictive permissions and atomic updates for the manifest.
+- Writes a task manifest listing every created resource before the first TrueNAS change. The default is `/tmp/haos-installer-<vm-name>-manifest.json`; pass `--manifest` for another trusted writable location.
+- Uses restrictive permissions and atomic updates for the manifest, requires it to be owned by root/current user, and rejects symlinked or unsafe writable parent directories.
 
 ## What it refuses to do
 
@@ -96,6 +96,8 @@ The installer verifies at runtime that these methods exist:
 ## Requirements
 
 Run from a **root TrueNAS host shell** for the simplest live-install workflow. `qemu-img` must write directly to `/dev/zvol/...`; a non-root run is rejected before downloads or TrueNAS changes. In this mode the installer uses local `midclt` and does not need Python WebSocket dependencies or stored API credentials.
+
+The launcher uses `/tmp` by default. If `TMPDIR` is set, it must be a real directory owned by root or the current user, with no unsafe group/world-writable ancestors; `/tmp`-style sticky directories are supported.
 
 Remote/API mode is also possible if `websocket-client` 0.18.0 or newer is available in your controlled environment (or the `websockets` sync adapter is available), but a real install still needs access to write the verified converted image into the newly created `/dev/zvol/...` path.
 

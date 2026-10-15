@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import os
 import pathlib
 import re
 import subprocess
@@ -46,6 +47,44 @@ class ManifestPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             requested = pathlib.Path(d) / "persistent" / "manifest.json"
             self.assertEqual(installer.resolve_manifest_path(str(requested), "haos-test"), requested.resolve())
+
+    def test_resume_manifest_rejects_untrusted_parent_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            shared = pathlib.Path(d) / "shared"
+            shared.mkdir()
+            shared.chmod(0o777)
+            manifest = shared / "manifest.json"
+            manifest.write_text("{}")
+            manifest.chmod(0o600)
+            with self.assertRaisesRegex(installer.InstallerError, "group/world-writable directory"):
+                installer.read_manifest_file(manifest)
+
+    def test_create_manifest_refuses_untrusted_parent_before_writing(self):
+        plan = installer.Plan(True, "version", "tank", "tank/haos-vms/haos", "haos", "br0", 2, 4096, 64, "https://example.test/i", "a"*64, 10, False)
+        with tempfile.TemporaryDirectory() as d:
+            shared = pathlib.Path(d) / "shared"
+            shared.mkdir()
+            shared.chmod(0o777)
+            manifest = shared / "manifest.json"
+            with self.assertRaisesRegex(installer.InstallerError, "group/world-writable directory"):
+                installer.create_manifest(manifest, plan)
+            self.assertFalse(manifest.exists())
+
+    def test_resume_manifest_rejects_foreign_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = pathlib.Path(d) / "manifest.json"
+            manifest.write_text("{}")
+            foreign = mock.Mock(st_mode=installer.stat.S_IFREG | 0o600, st_size=2, st_uid=installer.os.geteuid() + 1)
+            with mock.patch.object(installer.os, "fstat", return_value=foreign):
+                with self.assertRaisesRegex(installer.InstallerError, "owned by root or the current user"):
+                    installer.read_manifest_file(manifest)
+
+    def test_resume_manifest_fifo_is_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = pathlib.Path(d) / "manifest.fifo"
+            os.mkfifo(manifest)
+            with self.assertRaisesRegex(installer.InstallerError, "regular file"):
+                installer.read_manifest_file(manifest)
 
     def test_resume_manifest_reader_rejects_symlinks_and_group_world_writable_files(self):
         with tempfile.TemporaryDirectory() as d:
@@ -101,6 +140,17 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("--proto-redir '=https'", text)
         self.assertIn("limit = 128 * 1024 * 1024", text)
         self.assertIn("refusing an HTTPS-to-HTTP redirect", text)
+
+    def test_launcher_rejects_untrusted_tmpdir_before_network_access(self):
+        with tempfile.TemporaryDirectory() as d:
+            pathlib.Path(d).chmod(0o777)
+            env = os.environ.copy()
+            env["TMPDIR"] = d
+            env["HAOS_TRUENAS_INSTALLER_REF"] = "main"
+            result = subprocess.run(["/bin/sh", str(ROOT / "install.sh"), "--preview"], env=env, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsafe temporary-directory", result.stderr)
+            self.assertNotIn("Downloading HAOS TrueNAS installer archive", result.stdout)
 
 
 class SafeArchiveExtractionTests(unittest.TestCase):
@@ -396,8 +446,16 @@ class DownloadSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cache = pathlib.Path(d) / "cache"; cache.mkdir()
             with mock.patch.object(installer.os, "geteuid", return_value=actual_uid + 1):
-                with self.assertRaisesRegex(installer.InstallerError, "choose a new --cache-dir"):
+                with self.assertRaisesRegex(installer.InstallerError, "not owned by root or the current user|choose a new --cache-dir"):
                     installer.ensure_private_cache_dir(cache)
+
+    def test_cache_rejects_group_world_writable_parent(self):
+        with tempfile.TemporaryDirectory() as d:
+            shared = pathlib.Path(d) / "shared"
+            shared.mkdir()
+            shared.chmod(0o777)
+            with self.assertRaisesRegex(installer.InstallerError, "group/world-writable directory"):
+                installer.ensure_private_cache_dir(shared / "cache")
 
     class Response:
         def __init__(self, chunks, headers=None, url="https://example.test/image.xz"):
@@ -565,6 +623,12 @@ class PlanTests(unittest.TestCase):
         client.responses["vm.query"] = [{"name":"haos"}]
         with self.assertRaises(installer.InstallerError):
             installer.build_plan(client, self.args())
+    def test_cli_nic_must_be_an_existing_attachment_choice(self):
+        client = self.base_client()
+        with self.assertRaisesRegex(installer.InstallerError, "not an existing TrueNAS VM attachment choice"):
+            installer.build_plan(client, self.args(nic="not-a-real-bridge"))
+        self.assertFalse(any(c[0] in {"pool.dataset.create", "vm.create", "vm.device.create"} for c in client.calls))
+
     def test_existing_zvol_refused(self):
         client = self.base_client()
         client.responses["pool.dataset.query"] = 1
@@ -681,8 +745,14 @@ class PlanTests(unittest.TestCase):
             @installer.contextlib.contextmanager
             def prepared(*unused):
                 yield pathlib.Path(d) / "prepared.qcow2"
+            actual_uid = installer.os.geteuid()
+            uid_calls = 0
+            def effective_uid():
+                nonlocal uid_calls
+                uid_calls += 1
+                return 0 if uid_calls == 1 else actual_uid
             with installer.contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(installer.os,"geteuid",return_value=0))
+                stack.enter_context(mock.patch.object(installer.os,"geteuid",side_effect=effective_uid))
                 stack.enter_context(mock.patch.object(installer,"require_tools_for_install"))
                 stack.enter_context(mock.patch.object(installer,"download_and_verify",return_value=pathlib.Path(d)/"verified.xz"))
                 stack.enter_context(mock.patch.object(installer,"prepared_qcow_image",prepared))
@@ -718,6 +788,51 @@ class PlanTests(unittest.TestCase):
             args = installer.parse_args(["--resume-manifest", str(path)])
             with self.assertRaisesRegex(installer.InstallerError, "no VM or devices"):
                 installer.build_plan(self.base_client(), args)
+
+    def test_fresh_install_records_disk_before_nic_creation_can_fail(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haostest", "haostest", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "manifest.json"
+            args = installer.parse_args(["--vm-name", plan.vm_name, "--manifest", str(path), "--no-start"])
+            args.cache_dir = str(pathlib.Path(d) / "cache")
+            class FailingNicClient:
+                def __init__(self): self.calls=[]
+                def call(self, method, params=None):
+                    self.calls.append((method, params))
+                    if method == "pool.dataset.query": return []
+                    if method == "pool.dataset.create":
+                        if not params:
+                            raise AssertionError("pool.dataset.create is missing parameters")
+                        return {"id":params[0]["name"]}
+                    if method == "vm.create": return {"id":17}
+                    if method == "vm.device.create":
+                        if len([call for call in self.calls if call[0] == method]) == 2:
+                            raise installer.InstallerError("simulated NIC creation failure")
+                        return {"id":31}
+                    raise AssertionError(f"Unexpected middleware call: {method}")
+            client = FailingNicClient()
+            @installer.contextlib.contextmanager
+            def prepared(*unused):
+                yield pathlib.Path(d) / "prepared.qcow2"
+            actual_uid = installer.os.geteuid()
+            calls = 0
+            def effective_uid():
+                nonlocal calls
+                calls += 1
+                return 0 if calls == 1 else actual_uid
+            with installer.contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(installer.os, "geteuid", side_effect=effective_uid))
+                stack.enter_context(mock.patch.object(installer, "require_tools_for_install"))
+                stack.enter_context(mock.patch.object(installer, "download_and_verify", return_value=pathlib.Path(d) / "image.xz"))
+                stack.enter_context(mock.patch.object(installer, "prepared_qcow_image", prepared))
+                stack.enter_context(mock.patch.object(installer.Path, "exists", return_value=True))
+                stack.enter_context(mock.patch.object(installer.os, "access", return_value=True))
+                stack.enter_context(mock.patch.object(installer, "convert_qcow_to_zvol"))
+                with self.assertRaisesRegex(installer.InstallerError, "simulated NIC creation failure"):
+                    installer.install(client, plan, args)
+            saved = installer.json.loads(path.read_text())
+            self.assertEqual([resource["type"] for resource in saved["resources"]], ["dataset", "zvol", "vm", "device"])
+            self.assertEqual(saved["resources"][-1], {"type":"device", "id":31, "kind":"DISK"})
 
 if __name__ == "__main__":
     unittest.main()
