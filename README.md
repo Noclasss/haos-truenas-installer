@@ -6,21 +6,21 @@ This project is for community users who want a one-command, guided HAOS install 
 
 ## One-command guided launcher
 
-Replace `<commit>` with a published commit SHA from this repository. The installer is interactive when you leave the pool, network, VM name, resource, and disk-size options off the command line. It will show the complete plan and wait for you to type `CREATE` before making changes. The pool menu chooses the TrueNAS storage pool for the VM disk; it does not select or repartition a physical drive.
+The copy/paste commands below are pinned to the published installer commit `adf2dc92aed0348b0e7203133ba8aea051bbf927`. For reproducible use, keep the same commit SHA in both the URL and `HAOS_TRUENAS_INSTALLER_REF`. When a newer installer commit is published, update both occurrences to that full SHA.
 
 Run a read-only preview first:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | HAOS_TRUENAS_INSTALLER_REF=<commit> sh -s -- --preview
+REF=adf2dc92aed0348b0e7203133ba8aea051bbf927; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/install.sh" | HAOS_TRUENAS_INSTALLER_REF="$REF" sh -s -- --preview
 ```
 
-When the preview looks right, run this one-line guided install from a root shell, or keep `sudo` as shown:
+When the preview looks right, paste this one-line guided install from a root shell, or keep `sudo` as shown:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sudo env HAOS_TRUENAS_INSTALLER_REF=<commit> sh -s -- --no-start
+REF=adf2dc92aed0348b0e7203133ba8aea051bbf927; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/install.sh" | sudo env HAOS_TRUENAS_INSTALLER_REF="$REF" sh -s -- --no-start
 ```
 
-The prompts let you choose the healthy storage pool, existing network attachment, VM name, CPU and RAM, and virtual disk size. The installer then displays the selected pool, zvol path and size, network, VM settings, and start behavior. Review that plan carefully; type `CREATE` only if it is correct. `--no-start` leaves the new VM powered off so you can start it yourself after creation.
+The prompts let you choose the healthy storage pool, existing network attachment, VM name, CPU and RAM, and virtual disk size. The installer then displays the selected pool, zvol path and size, network, VM settings, and start behavior. Review that plan carefully; type `CREATE` only if it is correct. `--no-start` leaves the new VM powered off so you can start it yourself after creation. The pool menu chooses the TrueNAS storage pool for the VM disk; it does not select or repartition a physical drive.
 
 Preview mode may be run from `main`, but live installs intentionally refuse an unpinned `main` launcher unless you set `HAOS_TRUENAS_ALLOW_UNPINNED=1`. You can also set `HAOS_TRUENAS_INSTALLER_REF=<commit>` when using the launcher from a branch copy of `install.sh`.
 
