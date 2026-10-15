@@ -216,6 +216,83 @@ def select_from(label: str, items: list[str], default: str|None=None) -> str:
         except Exception:
             print("Enter a listed number.")
 
+def build_resume_plan(client, args, info: dict, version: str, required: list[str]) -> tuple[Plan, dict]:
+    if args.manifest:
+        raise InstallerError("Use only --resume-manifest when resuming; --manifest cannot be combined")
+    path = Path(args.resume_manifest).expanduser()
+    try:
+        data = json.loads(path.read_text())
+        if data.get("tool") != APP or not isinstance(data.get("plan"), dict):
+            raise ValueError("unrecognized manifest")
+        plan = Plan(**data["plan"])
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise InstallerError(f"Cannot read a valid installer manifest at {path}") from exc
+    if plan.preview or plan.autostart or not version_supported(plan.true_version) or version != plan.true_version:
+        raise InstallerError("Resume manifest is not a compatible live-install plan for this TrueNAS version")
+    validate_name(plan.vm_name, "VM")
+    validate_name(plan.pool, "pool")
+    if not 2 <= plan.vcpus <= 16 or plan.ram_mib < 2048 or plan.disk_gib < 32:
+        raise InstallerError("Resume manifest contains resources below the supported minimums")
+    if not plan.image_url.startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", plan.image_sha256) or plan.image_size < 0:
+        raise InstallerError("Resume manifest contains invalid image metadata")
+    if not 1 <= args.max_download_gib <= 10:
+        raise InstallerError("Maximum download size must be between 1 and 10 GiB")
+    parts = plan.zvol.split("/")
+    if len(parts) != 3 or parts[0] != plan.pool or parts[1] != "haos-vms":
+        raise InstallerError("Resume manifest has an unexpected zvol path")
+    validate_name(parts[2], "zvol")
+    parent = "/".join(parts[:-1])
+    dev = f"/dev/zvol/{plan.zvol}"
+    resources = data.get("resources")
+    expected_zvol = {"type":"zvol","id":plan.zvol,"dev":dev}
+    if not isinstance(resources, list) or resources.count(expected_zvol) != 1:
+        raise InstallerError("Resume manifest does not positively identify this zvol as created by the installer")
+    if sum(1 for resource in resources if isinstance(resource, dict) and resource.get("type") == "dataset") > 1:
+        raise InstallerError("Resume manifest contains multiple dataset records")
+    for resource in resources:
+        if not isinstance(resource, dict):
+            raise InstallerError("Resume manifest contains an invalid resource record")
+        if resource.get("type") == "dataset" and resource.get("id") == parent:
+            continue
+        if resource == expected_zvol:
+            continue
+        raise InstallerError("Resume is allowed only while the manifest tracks the expected parent dataset and zvol, with no VM or devices")
+    if args.zvol_name and args.zvol_name != parts[2]:
+        raise InstallerError("--zvol-name does not match the saved resume plan")
+    for arg_name, plan_name in (("pool","pool"),("nic","nic_attach"),("vm_name","vm_name"),("vcpus","vcpus"),("ram_mib","ram_mib"),("disk_gib","disk_gib")):
+        requested = getattr(args,arg_name,None)
+        if requested is not None and requested != getattr(plan,plan_name):
+            raise InstallerError(f"--{arg_name.replace('_','-')} does not match the saved resume plan")
+    if args.no_start and plan.start_vm:
+        raise InstallerError("Saved plan starts the VM; omit --no-start or use a no-start manifest")
+    if args.test_limits and (plan.vcpus > 2 or plan.ram_mib > 2048 or plan.disk_gib > 32):
+        raise InstallerError("Saved plan exceeds --test-limits")
+    if (args.image_url and args.image_url != plan.image_url) or (args.image_sha256 and args.image_sha256.lower() != plan.image_sha256):
+        raise InstallerError("Image arguments do not match the saved resume plan")
+    pools = client.call("pool.query")
+    if not any(p.get("name") == plan.pool and p.get("healthy") and p.get("status") == "ONLINE" for p in pools):
+        raise InstallerError(f"Pool {plan.pool!r} is not healthy and ONLINE")
+    choices = client.call("vm.device.nic_attach_choices")
+    nics = (choices.get("BRIDGE") or []) + (choices.get("MACVLAN") or [])
+    if plan.nic_attach not in nics:
+        raise InstallerError(f"Saved network attachment {plan.nic_attach!r} is no longer available")
+    if any(v.get("name") == plan.vm_name for v in client.call("vm.query")):
+        raise InstallerError(f"VM {plan.vm_name!r} already exists; refusing to modify it during resume")
+    zvols = client.call("pool.dataset.query", [[["id","=",plan.zvol]]])
+    parent_ds = client.call("pool.dataset.query", [[["id","=",parent]]])
+    if len(zvols) != 1 or zvols[0].get("type") != "VOLUME":
+        raise InstallerError("Manifest-owned zvol is missing or has an unexpected type")
+    size = zvols[0].get("volsize")
+    if isinstance(size, dict): size = size.get("parsed")
+    if int(size or 0) != plan.disk_gib * 1024**3:
+        raise InstallerError("Manifest-owned zvol size differs from the saved plan")
+    if len(parent_ds) != 1 or parent_ds[0].get("type") != "FILESYSTEM":
+        raise InstallerError("Expected parent filesystem is missing or has an unexpected type")
+    asset = Path(urllib.parse.urlparse(plan.image_url).path).name
+    if args.preview:
+        plan = dataclasses.replace(plan, preview=True)
+    return plan, {"info":info,"methods_checked":required,"haos_asset":asset,"resume":True}
+
 def build_plan(client, args) -> tuple[Plan, dict]:
     info = client.call("system.info")
     version = client.call("system.version")
@@ -227,6 +304,8 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     if not version_supported(version):
         if not args.preview or not args.allow_unsupported_version:
             raise InstallerError(f"Unsupported TrueNAS version {version}. This BETA supports 25.10.x and 26.0.0-BETA.x. Unsupported versions may only be evaluated in read-only preview mode with --allow-unsupported-version; live installs remain blocked.")
+    if args.resume_manifest:
+        return build_resume_plan(client, args, info, version, required)
     pools = client.call("pool.query")
     healthy = [p for p in pools if p.get("healthy") and p.get("status") == "ONLINE"]
     if not healthy:
@@ -271,12 +350,13 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     return Plan(args.preview, version, pool_name, zvol, vm_name, nic, vcpus, ram_mib, disk_gib, image["url"], image["sha256"].lower(), int(image.get("size") or 0), not args.no_start, False), {"info": info, "methods_checked": required, "haos_version": image.get("version"), "haos_asset": image.get("name")}
 
 def print_plan(plan: Plan, meta: dict):
-    print("\nInstallation plan" + (" (PREVIEW - no changes will be made)" if plan.preview else ""))
+    suffix = " (PREVIEW - no changes will be made)" if plan.preview else (" (RESUME - manifest-owned partial install)" if meta.get("resume") else "")
+    print("\nInstallation plan" + suffix)
     print(f"  TrueNAS version: {plan.true_version}")
     print(f"  HAOS image: {meta.get('haos_asset')} from official Home Assistant OS GitHub releases")
     print(f"  Image sha256: {plan.image_sha256}")
     print(f"  Pool: {plan.pool}")
-    print(f"  New zvol: {plan.zvol} ({plan.disk_gib} GiB)")
+    print(f"  {'Manifest-owned zvol' if meta.get('resume') else 'New zvol'}: {plan.zvol} ({plan.disk_gib} GiB)")
     print(f"  New VM: {plan.vm_name} ({plan.vcpus} vCPU, {plan.ram_mib} MiB RAM, autostart disabled)")
     print(f"  NIC attaches to existing: {plan.nic_attach}")
     print("  Firmware: UEFI, OVMF_CODE.fd, Secure Boot disabled")
@@ -386,8 +466,11 @@ def prepared_qcow_image(image: Path, cache_dir: Path, disk_gib: int):
         qcow.unlink(missing_ok=True)
 
 
-def convert_qcow_to_zvol(qcow: Path, zvol_dev: str):
-    run_checked(["qemu-img", "convert", "-p", "-f", "qcow2", "-O", "raw", str(qcow), zvol_dev])
+def convert_qcow_to_zvol(qcow: Path, zvol_dev: str, manifest_path: Path):
+    try:
+        run_checked(["qemu-img", "convert", "-p", "-f", "qcow2", "-O", "raw", str(qcow), zvol_dev])
+    except subprocess.CalledProcessError as exc:
+        raise InstallerError(f"Disk conversion failed for {zvol_dev}. Any created resources remain recorded in {manifest_path}; fix the cause, then use --resume-manifest {manifest_path} instead of starting a fresh install") from exc
 
 def run_checked(cmd: list[str], **kwargs):
     printable = " ".join(cmd[:3]) + (" ..." if len(cmd)>3 else "")
@@ -427,9 +510,24 @@ def update_manifest(path: Path, manifest: dict):
         Path(temp_name).unlink(missing_ok=True)
 
 def install(client, plan: Plan, args):
+    if os.geteuid() != 0:
+        raise InstallerError("Live installation requires a root TrueNAS shell because qemu-img must write to /dev/zvol. No new resources were created by this run; rerun as root or use --resume-manifest after a partial run.")
     require_tools_for_install(False)
-    manifest_path = resolve_manifest_path(args.manifest, plan.vm_name)
-    manifest = create_manifest(manifest_path, plan)
+    manifest_path = Path(args.resume_manifest).expanduser().resolve() if args.resume_manifest else resolve_manifest_path(args.manifest, plan.vm_name)
+    if args.resume_manifest:
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise InstallerError(f"Cannot read resume manifest at {manifest_path}") from exc
+        if manifest.get("tool") != APP or manifest.get("plan") != dataclasses.asdict(plan):
+            raise InstallerError("Resume manifest plan changed since preview; refusing to continue")
+        parent = "/".join(plan.zvol.split("/")[:-1])
+        expected_zvol = {"type":"zvol","id":plan.zvol,"dev":f"/dev/zvol/{plan.zvol}"}
+        resources = manifest.get("resources")
+        if not isinstance(resources, list) or resources.count(expected_zvol) != 1 or any(not isinstance(r, dict) or not (r == expected_zvol or (r.get("type") == "dataset" and r.get("id") == parent)) for r in resources):
+            raise InstallerError("Resume manifest resources changed since validation; refusing to continue")
+    else:
+        manifest = create_manifest(manifest_path, plan)
     print(f"Task manifest: {manifest_path}")
     cache_dir = Path(args.cache_dir).expanduser()
     image = download_and_verify(
@@ -444,19 +542,35 @@ def install(client, plan: Plan, args):
     # Download, checksum, decompression, and QCOW2 validation all happen before
     # creating any TrueNAS datasets, zvols, VMs, or devices.
     with prepared_qcow_image(image, cache_dir, plan.disk_gib) as qcow:
-        parent_matches = client.call("pool.dataset.query", [[["id","=",parent]]])
-        if parent_matches:
-            if any(d.get("type") != "FILESYSTEM" for d in parent_matches):
-                raise InstallerError(f"Parent dataset {parent!r} exists but is not a filesystem; refusing to use it")
+        if args.resume_manifest:
+            parent_matches = client.call("pool.dataset.query", [[["id","=",parent]]])
+            zvol_matches = client.call("pool.dataset.query", [[["id","=",plan.zvol]]])
+            if len(parent_matches) != 1 or parent_matches[0].get("type") != "FILESYSTEM":
+                raise InstallerError("Resume parent dataset no longer matches the manifest")
+            if len(zvol_matches) != 1 or zvol_matches[0].get("type") != "VOLUME":
+                raise InstallerError("Resume zvol no longer matches the manifest")
+            volsize = zvol_matches[0].get("volsize")
+            if isinstance(volsize, dict): volsize = volsize.get("parsed")
+            if int(volsize or 0) != plan.disk_gib * 1024**3 or {"type":"zvol","id":plan.zvol,"dev":dev} not in manifest.get("resources",[]):
+                raise InstallerError("Resume zvol size or manifest ownership check failed")
+            if any(vm.get("name") == plan.vm_name for vm in client.call("vm.query")):
+                raise InstallerError(f"VM {plan.vm_name!r} appeared after resume planning; refusing to continue")
         else:
-            client.call("pool.dataset.create", [{"name": parent, "type":"FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}])
-            manifest["resources"].append({"type":"dataset", "id":parent}); update_manifest(manifest_path, manifest)
-        client.call("pool.dataset.create", [{"name": plan.zvol, "type":"VOLUME", "volsize": plan.disk_gib * 1024**3, "comments": f"Created by {APP} for {plan.vm_name}"}])
-        manifest["resources"].append({"type":"zvol", "id":plan.zvol, "dev":dev}); update_manifest(manifest_path, manifest)
+            parent_matches = client.call("pool.dataset.query", [[["id","=",parent]]])
+            if parent_matches:
+                if any(d.get("type") != "FILESYSTEM" for d in parent_matches):
+                    raise InstallerError(f"Parent dataset {parent!r} exists but is not a filesystem; refusing to use it")
+            else:
+                client.call("pool.dataset.create", [{"name": parent, "type":"FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}])
+                manifest["resources"].append({"type":"dataset", "id":parent}); update_manifest(manifest_path, manifest)
+            client.call("pool.dataset.create", [{"name": plan.zvol, "type":"VOLUME", "volsize": plan.disk_gib * 1024**3, "comments": f"Created by {APP} for {plan.vm_name}"}])
+            manifest["resources"].append({"type":"zvol", "id":plan.zvol, "dev":dev}); update_manifest(manifest_path, manifest)
         if not Path(dev).exists():
             raise InstallerError(f"Created zvol device path is not visible: {dev}")
-        # Destination is only the newly created zvol recorded in the manifest.
-        convert_qcow_to_zvol(qcow, dev)
+        if not os.access(dev, os.W_OK):
+            raise InstallerError(f"No write permission for {dev}; run the installer from a root TrueNAS shell")
+        # Destination is only a newly created or manifest-verified zvol.
+        convert_qcow_to_zvol(qcow, dev, manifest_path)
     vm = client.call("vm.create", [{
         "name": plan.vm_name,
         "description": f"Home Assistant OS VM created by {APP} (BETA)",
@@ -527,6 +641,7 @@ def parse_args(argv=None):
     ap.add_argument("--allow-unsupported-version", action="store_true", help="Allow unsupported versions in read-only preview only; live installs stay blocked.")
     ap.add_argument("--cache-dir", default="/tmp/haos-truenas-installer-cache")
     ap.add_argument("--manifest", help="Task manifest path (default: /tmp/haos-installer-<vm-name>-manifest.json)")
+    ap.add_argument("--resume-manifest", help="Resume only an incomplete install whose exact resources are recorded in this manifest")
     ap.add_argument("--max-download-gib", type=int, default=10)
     ap.add_argument("--lock-file", default="/tmp/haos-truenas-installer.lock")
     return ap.parse_args(argv)
@@ -557,7 +672,13 @@ def main(argv=None):
             if plan.preview:
                 print("\nPreview complete. No resources were created or modified.")
                 return 0
-            if not args.yes:
+            if os.geteuid() != 0:
+                raise InstallerError("Live installation requires a root TrueNAS shell because qemu-img must write to /dev/zvol. This check occurs before any download or resource creation.")
+            if args.resume_manifest:
+                confirm_text = ask("Type RESUME to continue this manifest-tracked partial install", "")
+                if confirm_text != "RESUME":
+                    raise InstallerError("Cancelled before any write operations")
+            elif not args.yes:
                 confirm = ask("Type CREATE to create this NEW VM and zvol", "")
                 if confirm != "CREATE":
                     raise InstallerError("Cancelled before any write operations")

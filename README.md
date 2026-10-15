@@ -86,7 +86,7 @@ The installer verifies at runtime that these methods exist:
 
 ## Requirements
 
-Run from the TrueNAS host shell for the simplest workflow. In that mode the installer uses the local `midclt` command and does not need Python WebSocket dependencies or stored API credentials.
+Run from a **root TrueNAS host shell** for the simplest live-install workflow. `qemu-img` must write directly to `/dev/zvol/...`; a non-root run is rejected before downloads or TrueNAS changes. In this mode the installer uses local `midclt` and does not need Python WebSocket dependencies or stored API credentials.
 
 Remote/API mode is also possible if the Python `websocket-client` package is available in your controlled environment, but a real install still needs access to write the verified converted image into the newly created `/dev/zvol/...` path.
 
@@ -143,6 +143,8 @@ python3 haos_truenas_installer.py \
 Use a unique name. Keep the manifest. For long-term recovery, set `--manifest` to a writable persistent path or copy the default manifest out of `/tmp` after installation. Clean up only resources positively identified in that manifest.
 
 ## Recovery from interrupted installation
+
+For a partial install that has only the manifest-owned parent dataset and zvol, run the pinned installer from a root TrueNAS shell with `--resume-manifest /path/to/manifest.json`. It validates the manifest, pool, network, zvol size, and absence of an existing VM, then requires typing `RESUME`. Resume never creates or overwrites the zvol; it writes only to that exact manifest-owned zvol and proceeds to create the VM/devices. Use `--preview --resume-manifest ...` first to check the saved plan without writes.
 
 1. Open the manifest written by the installer, for example:
 

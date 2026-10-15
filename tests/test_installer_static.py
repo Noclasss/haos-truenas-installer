@@ -41,12 +41,26 @@ class ManifestPathTests(unittest.TestCase):
     def test_manifest_permission_error_is_actionable_and_aborts_before_download(self):
         plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
         args = installer.parse_args(["--vm-name", "haos-test"])
-        with mock.patch.object(installer, "require_tools_for_install"):
-            with mock.patch.object(installer.os, "open", side_effect=PermissionError):
-                with mock.patch.object(installer, "download_and_verify") as download:
-                    with self.assertRaisesRegex(installer.InstallerError, "writable location"):
-                        installer.install(object(), plan, args)
-                    download.assert_not_called()
+        with mock.patch.object(installer.os, "geteuid", return_value=0):
+            with mock.patch.object(installer, "require_tools_for_install"):
+                with mock.patch.object(installer.os, "open", side_effect=PermissionError):
+                    with mock.patch.object(installer, "download_and_verify") as download:
+                        with self.assertRaisesRegex(installer.InstallerError, "writable location"):
+                            installer.install(object(), plan, args)
+                        download.assert_not_called()
+
+    def test_non_root_live_install_aborts_before_manifest_or_download(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/i", "a"*64, 10, False)
+        args = installer.parse_args(["--vm-name", "haos-test"])
+        with mock.patch.object(installer.os, "geteuid", return_value=1000):
+            with mock.patch.object(installer, "download_and_verify") as download:
+                with self.assertRaisesRegex(installer.InstallerError, "requires a root TrueNAS shell"):
+                    installer.install(object(), plan, args)
+                download.assert_not_called()
+    def test_conversion_error_points_to_manifest_resume_flow(self):
+        with mock.patch.object(installer, "run_checked", side_effect=installer.subprocess.CalledProcessError(1, ["qemu-img"])):
+            with self.assertRaisesRegex(installer.InstallerError, "--resume-manifest"):
+                installer.convert_qcow_to_zvol(pathlib.Path("image.qcow2"), "/dev/zvol/tank/haos", pathlib.Path("/tmp/manifest.json"))
 
 
 class LauncherTests(unittest.TestCase):
@@ -189,7 +203,7 @@ class FakeClient:
     def call(self, method, params=None, *extra):
         self.calls.append((method, params, extra))
         val = self.responses[method]
-        return val() if callable(val) else val
+        return val(params) if callable(val) else val
 
 class PlanTests(unittest.TestCase):
     def base_client(self):
@@ -249,6 +263,85 @@ class PlanTests(unittest.TestCase):
             client = self.base_client()
             with self.subTest(changes=changes), self.assertRaises(installer.InstallerError):
                 installer.build_plan(client, self.args(**changes))
+
+    def test_resume_manifest_accepts_only_exact_manifest_owned_partial_resources(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "manifest.json"
+            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":[{"type":"dataset","id":"tank/haos-vms"},{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol}]}))
+            args = installer.parse_args(["--resume-manifest", str(path), "--no-start"])
+            client = self.base_client()
+            def dataset_query(params):
+                target = params[0][0][2]
+                if target == plan.zvol:
+                    return [{"id":plan.zvol,"type":"VOLUME","volsize":{"parsed":32*1024**3}}]
+                if target == "tank/haos-vms":
+                    return [{"id":"tank/haos-vms","type":"FILESYSTEM"}]
+                return []
+            client.responses["pool.dataset.query"] = dataset_query
+            resumed, meta = installer.build_plan(client, args)
+            self.assertEqual(resumed, plan)
+            self.assertTrue(meta["resume"])
+            self.assertFalse(any(c[0] in {"vm.create","pool.dataset.create","vm.device.create","vm.start"} for c in client.calls))
+
+    def test_resume_install_reuses_owned_zvol_and_creates_only_new_vm_devices(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "manifest.json"
+            resources = [{"type":"dataset","id":"tank/haos-vms"},{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol}]
+            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":resources}))
+            args = installer.parse_args(["--resume-manifest", str(path), "--no-start"])
+            class ResumeClient:
+                def __init__(self): self.calls=[]
+                def call(self, method, params=None):
+                    self.calls.append((method,params))
+                    if method == "pool.dataset.query":
+                        target=params[0][0][2]
+                        if target == plan.zvol: return [{"id":plan.zvol,"type":"VOLUME","volsize":{"parsed":32*1024**3}}]
+                        return [{"id":"tank/haos-vms","type":"FILESYSTEM"}]
+                    if method == "vm.query": return []
+                    if method == "vm.create": return {"id":7}
+                    if method == "vm.device.create": return {"id":len([c for c in self.calls if c[0] == method])}
+                    raise AssertionError(f"Unexpected middleware call: {method}")
+            client=ResumeClient()
+            @installer.contextlib.contextmanager
+            def prepared(*unused):
+                yield pathlib.Path(d) / "prepared.qcow2"
+            with installer.contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(installer.os,"geteuid",return_value=0))
+                stack.enter_context(mock.patch.object(installer,"require_tools_for_install"))
+                stack.enter_context(mock.patch.object(installer,"download_and_verify",return_value=pathlib.Path(d)/"verified.xz"))
+                stack.enter_context(mock.patch.object(installer,"prepared_qcow_image",prepared))
+                stack.enter_context(mock.patch.object(installer.Path,"exists",return_value=True))
+                stack.enter_context(mock.patch.object(installer.os,"access",return_value=True))
+                convert=stack.enter_context(mock.patch.object(installer,"convert_qcow_to_zvol"))
+                installer.install(client,plan,args)
+            self.assertEqual([c[0] for c in client.calls].count("pool.dataset.create"),0)
+            self.assertEqual([c[0] for c in client.calls].count("vm.create"),1)
+            self.assertEqual([c[0] for c in client.calls].count("vm.device.create"),2)
+            self.assertNotIn("vm.start",[c[0] for c in client.calls])
+            convert.assert_called_once()
+            self.assertEqual([r["type"] for r in installer.json.loads(path.read_text())["resources"]], ["dataset","zvol","vm","device","device"])
+
+    def test_resume_preview_stays_read_only(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "manifest.json"
+            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":[{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol}]}))
+            args = installer.parse_args(["--preview", "--resume-manifest", str(path)])
+            client = self.base_client()
+            client.responses["pool.dataset.query"] = lambda params: ([{"id":plan.zvol,"type":"VOLUME","volsize":{"parsed":32*1024**3}}] if params[0][0][2] == plan.zvol else [{"id":"tank/haos-vms","type":"FILESYSTEM"}])
+            preview, _ = installer.build_plan(client, args)
+            self.assertTrue(preview.preview)
+
+    def test_resume_rejects_untracked_vm_or_device_resources(self):
+        plan = installer.Plan(False, "TrueNAS-26.0.0-BETA.2", "tank", "tank/haos-vms/haos-test", "haos-test", "br0", 2, 2048, 32, "https://example.test/haos.qcow2.xz", "a"*64, 1234, False)
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "manifest.json"
+            path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(plan),"resources":[{"type":"zvol","id":plan.zvol,"dev":"/dev/zvol/"+plan.zvol},{"type":"vm","name":"other"}]}))
+            args = installer.parse_args(["--resume-manifest", str(path)])
+            with self.assertRaisesRegex(installer.InstallerError, "no VM or devices"):
+                installer.build_plan(self.base_client(), args)
 
 if __name__ == "__main__":
     unittest.main()
