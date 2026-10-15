@@ -33,4 +33,4 @@ The installer selects the latest non-draft, non-prerelease Home Assistant OS rel
 
 - <https://github.com/home-assistant/operating-system/releases>
 
-It selects the `haos_ova-<version>.qcow2.xz` asset and verifies the SHA-256 digest reported by GitHub's release asset API before converting the image.
+It selects the `haos_ova-<version>.qcow2.xz` asset and compares the downloaded image against the SHA-256 digest and expected size reported by GitHub's release asset API before converting the image. Because GitHub supplies both the artifact and digest, this detects corruption or mismatch but is not an independent signature.

@@ -96,13 +96,13 @@ The installer verifies at runtime that these methods exist:
 
 Run from a **root TrueNAS host shell** for the simplest live-install workflow. `qemu-img` must write directly to `/dev/zvol/...`; a non-root run is rejected before downloads or TrueNAS changes. In this mode the installer uses local `midclt` and does not need Python WebSocket dependencies or stored API credentials.
 
-Remote/API mode is also possible if the Python `websocket-client` package is available in your controlled environment, but a real install still needs access to write the verified converted image into the newly created `/dev/zvol/...` path.
+Remote/API mode is also possible if `websocket-client` 0.18.0 or newer is available in your controlled environment (or the `websockets` sync adapter is available), but a real install still needs access to write the verified converted image into the newly created `/dev/zvol/...` path.
 
 Host tools needed for a real install:
 
 - `python3`
 - `curl` or `fetch`
-- `midclt` for local host mode, or `websocket-client` for remote API mode
+- `midclt` for local host mode, or `websocket-client` 0.18.0+ / the `websockets` sync adapter for remote API mode
 - `xz`
 - `qemu-img`
 
@@ -123,6 +123,18 @@ export TRUENAS_API_KEY='...'
 ```
 
 Do not put secrets in shell history. Prefer a root shell/session where credentials are not echoed.
+
+For remote `wss://` connections, server-certificate and hostname verification are enabled by default. For a private/self-signed TrueNAS certificate, trust its issuing CA explicitly:
+
+```sh
+export TRUENAS_URL=https://truenas.example.local
+export TRUENAS_CA_CERT=/path/to/truenas-ca.pem
+# or pass --tls-ca-cert /path/to/truenas-ca.pem
+```
+
+The `websocket-client` adapter must be version 0.18.0 or newer to enforce hostname verification. `--insecure-tls` is an explicit compatibility override that disables both certificate and hostname checks; it prints a warning and should only be used temporarily on a trusted network. Remote `ws://` is plaintext and exposes credentials/API traffic; local `midclt` is unaffected.
+
+The HAOS image’s SHA-256 and expected size are checked before use. GitHub supplies both the image and its digest through the same service, so this detects corruption/mismatch but is not an independent signature. Likewise, a commit-pinned installer archive over HTTPS still trusts GitHub to serve the source for that commit. The launcher extracts into a private temporary directory and rejects unsafe archive entries; pinning the commit remains the recommended supply-chain control.
 
 ## Preview mode
 

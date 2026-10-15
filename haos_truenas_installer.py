@@ -19,6 +19,7 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -97,20 +98,67 @@ class MidcltClient:
                 return out
             raise InstallerError(f"TrueNAS midclt {method} returned invalid JSON output") from exc
 
+def create_tls_context(ca_cert: str|None = None, insecure_tls: bool = False) -> ssl.SSLContext:
+    ca_path = Path(ca_cert).expanduser() if ca_cert else None
+    if ca_path is not None and (not ca_path.is_file() or ca_path.is_symlink()):
+        raise InstallerError("The configured TrueNAS CA certificate must be an existing regular file, not a symlink")
+    try:
+        if insecure_tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            return context
+        context = ssl.create_default_context()
+        if ca_path is not None:
+            context.load_verify_locations(cafile=str(ca_path))
+        return context
+    except (OSError, ssl.SSLError) as exc:
+        raise InstallerError("Could not initialize TLS verification for the TrueNAS connection") from exc
+
+def websocket_client_supports_hostname_verification() -> bool:
+    version = getattr(websocket, "__version__", "") if websocket is not None else ""
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", version) if isinstance(version, str) else None
+    return bool(match and tuple(int(part or 0) for part in match.groups()) >= (0, 18, 0))
+
 class TrueNASClient:
-    def __init__(self, url: str, username: str|None, password: str|None, api_key: str|None, timeout: int = 60):
+    def __init__(self, url: str, username: str|None, password: str|None, api_key: str|None, timeout: int = 60, tls_ca_cert: str|None = None, insecure_tls: bool = False):
         self.url = normalize_ws_url(url)
         self.username = username
         self.password = password
         self.api_key = api_key
         self.timeout = timeout
         self._id = 0
-        if websocket is not None:
-            self.ws = websocket.create_connection(self.url, timeout=timeout, sslopt={"cert_reqs": ssl.CERT_NONE})
+        secure = self.url.startswith("wss://")
+        if (tls_ca_cert or insecure_tls) and not secure:
+            raise InstallerError("--tls-ca-cert and --insecure-tls apply only to a wss:// TrueNAS URL")
+        if insecure_tls:
+            print("WARNING: --insecure-tls disables certificate and hostname verification; use --tls-ca-cert instead when possible.", file=sys.stderr)
+        tls_context = create_tls_context(tls_ca_cert, insecure_tls) if secure else None
+        if self.url.startswith("ws://"):
+            host = urllib.parse.urlparse(self.url).hostname
+            if host not in ("localhost", "127.0.0.1", "::1"):
+                print("WARNING: remote ws:// sends TrueNAS credentials and API traffic without TLS; use an HTTPS/WSS URL with a trusted certificate where possible.", file=sys.stderr)
+        use_websocket_client = websocket is not None
+        if secure and not insecure_tls and use_websocket_client and not websocket_client_supports_hostname_verification():
+            if ws_sync_connect is None:
+                raise InstallerError("Secure remote connections with websocket-client require version 0.18.0 or newer for hostname verification; upgrade it or use the websockets sync adapter")
+            use_websocket_client = False
+        if use_websocket_client:
+            assert websocket is not None
+            if secure:
+                sslopt = {"cert_reqs": ssl.CERT_NONE if insecure_tls else ssl.CERT_REQUIRED, "check_hostname": not insecure_tls}
+                if tls_ca_cert and not insecure_tls:
+                    sslopt["ca_certs"] = str(Path(tls_ca_cert).expanduser())
+                self.ws = websocket.create_connection(self.url, timeout=timeout, sslopt=sslopt)
+            else:
+                self.ws = websocket.create_connection(self.url, timeout=timeout)
             self._send = self.ws.send
             self._recv = self.ws.recv
         elif ws_sync_connect is not None:
-            self.ws = ws_sync_connect(self.url, open_timeout=timeout, max_size=64_000_000)
+            if secure:
+                self.ws = ws_sync_connect(self.url, open_timeout=timeout, max_size=64_000_000, ssl=tls_context)
+            else:
+                self.ws = ws_sync_connect(self.url, open_timeout=timeout, max_size=64_000_000)
             self._send = self.ws.send
             self._recv = self.ws.recv
         else:
@@ -172,12 +220,34 @@ def validate_vm_name(name: str) -> str:
         raise InstallerError("Invalid VM name. TrueNAS accepts only 1-63 ASCII letters and numbers for VM names.")
     return name
 
+def dataset_comment(dataset: dict) -> str:
+    properties = dataset.get("user_properties") or {}
+    comment = properties.get("comments", dataset.get("comments", ""))
+    if isinstance(comment, dict):
+        return str(comment.get("parsed") or comment.get("value") or comment.get("rawvalue") or "")
+    return str(comment or "")
+
 def version_supported(version: str) -> bool:
     return any(p.match(version) for p in SUPPORTED_VERSION_PATTERNS)
 
+class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlparse(newurl).scheme.lower() != "https":
+            raise InstallerError("Refusing a download redirect that leaves HTTPS")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+def open_https_url(req, timeout: int):
+    url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment or any(ch.isspace() for ch in url):
+        raise InstallerError("Network downloads must use a valid HTTPS URL without embedded credentials or a fragment")
+    return urllib.request.build_opener(HTTPSOnlyRedirectHandler()).open(req, timeout=timeout)
+
 def fetch_latest_haos_asset() -> dict:
     req = urllib.request.Request(HAOS_REPO_API, headers={"Accept":"application/vnd.github+json", "User-Agent":APP})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with open_https_url(req, timeout=60) as resp:
+        if urllib.parse.urlparse(resp.geturl()).scheme.lower() != "https":
+            raise InstallerError("HAOS release metadata did not remain on HTTPS")
         releases = json.load(resp)
     stable = next((r for r in releases if not r.get("draft") and not r.get("prerelease")), None)
     if not stable:
@@ -189,9 +259,21 @@ def fetch_latest_haos_asset() -> dict:
     if not asset:
         raise InstallerError("No HAOS OVA qcow2.xz asset found in latest stable release")
     digest = asset.get("digest") or ""
-    if not digest.startswith("sha256:"):
-        raise InstallerError("GitHub release asset does not provide a sha256 digest; refusing unverifiable image")
-    return {"version": stable["tag_name"], "url": asset["browser_download_url"], "sha256": digest.split(":",1)[1], "size": int(asset["size"]), "name": asset["name"]}
+    asset_url = asset.get("browser_download_url") or ""
+    parsed_asset_url = urllib.parse.urlparse(asset_url)
+    expected_asset_path = f"/home-assistant/operating-system/releases/download/{stable['tag_name']}/{asset.get('name', '')}"
+    if (parsed_asset_url.scheme != "https" or parsed_asset_url.netloc != "github.com"
+            or parsed_asset_url.path != expected_asset_path or parsed_asset_url.query or parsed_asset_url.fragment):
+        raise InstallerError("HAOS release asset URL is not the expected HTTPS GitHub OVA release URL")
+    if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+        raise InstallerError("GitHub release asset does not provide a valid sha256 digest; refusing unverifiable image")
+    try:
+        asset_size = int(asset["size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InstallerError("HAOS release asset has an invalid size") from exc
+    if asset_size <= 0:
+        raise InstallerError("HAOS release asset has an invalid size")
+    return {"version": stable["tag_name"], "url": asset_url, "sha256": digest.split(":",1)[1], "size": asset_size, "name": asset["name"]}
 
 def require_tools_for_install(preview: bool):
     needed = ["xz", "qemu-img"]
@@ -269,10 +351,13 @@ def build_resume_plan(client, args, info: dict, version: str, required: list[str
         raise InstallerError("Use only --resume-manifest when resuming; --manifest cannot be combined")
     path = Path(args.resume_manifest).expanduser()
     try:
-        data = json.loads(path.read_text())
-        if data.get("tool") != APP or not isinstance(data.get("plan"), dict):
+        data = read_manifest_file(path)
+        if not isinstance(data, dict) or data.get("tool") != APP or not isinstance(data.get("plan"), dict):
             raise ValueError("unrecognized manifest")
         plan = Plan(**data["plan"])
+        manifest_vm_name = plan.vm_name
+        if not isinstance(manifest_vm_name, str) or not manifest_vm_name or len(manifest_vm_name) > 63:
+            raise ValueError("invalid saved VM name")
         if args.vm_name:
             plan = dataclasses.replace(plan, vm_name=validate_vm_name(args.vm_name))
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -326,18 +411,26 @@ def build_resume_plan(client, args, info: dict, version: str, required: list[str
     nics = (choices.get("BRIDGE") or []) + (choices.get("MACVLAN") or [])
     if plan.nic_attach not in nics:
         raise InstallerError(f"Saved network attachment {plan.nic_attach!r} is no longer available")
-    if any(v.get("name") == plan.vm_name for v in client.call("vm.query")):
-        raise InstallerError(f"VM {plan.vm_name!r} already exists; refusing to modify it during resume")
+    existing_vm_names = {manifest_vm_name, plan.vm_name}
+    if any(v.get("name") in existing_vm_names for v in client.call("vm.query")):
+        raise InstallerError("A VM with the saved or requested name already exists; refusing to overwrite or resume its storage")
+    if any((device.get("attributes") or {}).get("path") == dev for device in client.call("vm.device.query")):
+        raise InstallerError("The manifest zvol is attached to a VM device; refusing to overwrite it")
     zvols = client.call("pool.dataset.query", [[["id","=",plan.zvol]]])
     parent_ds = client.call("pool.dataset.query", [[["id","=",parent]]])
     if len(zvols) != 1 or zvols[0].get("type") != "VOLUME":
         raise InstallerError("Manifest-owned zvol is missing or has an unexpected type")
+    if dataset_comment(zvols[0]) != f"Created by {APP} for {manifest_vm_name}":
+        raise InstallerError("Manifest zvol does not have the expected installer ownership marker")
     size = zvols[0].get("volsize")
     if isinstance(size, dict): size = size.get("parsed")
     if int(size or 0) != plan.disk_gib * 1024**3:
         raise InstallerError("Manifest-owned zvol size differs from the saved plan")
     if len(parent_ds) != 1 or parent_ds[0].get("type") != "FILESYSTEM":
         raise InstallerError("Expected parent filesystem is missing or has an unexpected type")
+    if any(r.get("type") == "dataset" and r.get("id") == parent for r in resources):
+        if dataset_comment(parent_ds[0]) != f"Created by {APP} for HAOS VM disks":
+            raise InstallerError("Manifest parent dataset does not have the expected installer ownership marker")
     asset = Path(urllib.parse.urlparse(plan.image_url).path).name
     if args.preview:
         plan = dataclasses.replace(plan, preview=True)
@@ -362,7 +455,7 @@ def build_plan(client, args) -> tuple[Plan, dict]:
         raise InstallerError("No healthy ONLINE pools found")
     print("\nHealthy pools:")
     for p in healthy: print(" - " + summarize_pool(p))
-    pool_name = args.pool or select_storage_pool(healthy)
+    pool_name = validate_name(args.pool or select_storage_pool(healthy), "pool")
     pool = next((p for p in healthy if p["name"] == pool_name), None)
     if pool is None:
         raise InstallerError(f"Pool {pool_name!r} is not healthy and ONLINE; choose one of the listed pools")
@@ -414,6 +507,18 @@ def print_plan(plan: Plan, meta: dict):
     print("  Firmware: UEFI, OVMF_CODE.fd, Secure Boot disabled")
     print(f"  Start after creation: {plan.start_vm}")
 
+def ensure_private_cache_dir(cache_dir: Path) -> Path:
+    cache_dir = Path(cache_dir).expanduser()
+    try:
+        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = cache_dir.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise InstallerError("Image cache directory must be a real directory owned by the current user")
+        os.chmod(cache_dir, 0o700)
+    except OSError as exc:
+        raise InstallerError("Could not create a private image cache directory") from exc
+    return cache_dir
+
 def download_and_verify(url: str, sha256: str, cache_dir: Path, max_bytes: int = MAX_DOWNLOAD_BYTES_DEFAULT, expected_size: int|None = None) -> Path:
     if not url.startswith("https://"):
         raise InstallerError("HAOS image downloads must use HTTPS")
@@ -423,9 +528,15 @@ def download_and_verify(url: str, sha256: str, cache_dir: Path, max_bytes: int =
         raise InstallerError("Download byte limit must be positive")
     if expected_size is not None and not 0 <= expected_size <= max_bytes:
         raise InstallerError(f"HAOS image asset size is outside the configured 0–{max_bytes} byte limit")
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = ensure_private_cache_dir(cache_dir)
     dest = cache_dir / f"haos-{sha256.lower()}.qcow2.xz"
-    if dest.exists():
+    try:
+        cached_info = dest.lstat()
+    except FileNotFoundError:
+        cached_info = None
+    if cached_info is not None:
+        if not stat.S_ISREG(cached_info.st_mode) or cached_info.st_uid != os.geteuid():
+            raise InstallerError("Refusing an unsafe or unowned HAOS cache entry")
         cached_hash = hashlib.sha256()
         with open(dest, "rb") as cached_file:
             for chunk in iter(lambda: cached_file.read(1024*1024), b""):
@@ -439,7 +550,9 @@ def download_and_verify(url: str, sha256: str, cache_dir: Path, max_bytes: int =
     total = 0
     req = urllib.request.Request(url, headers={"User-Agent": APP})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_https_url(req, timeout=120) as resp:
+            if urllib.parse.urlparse(resp.geturl()).scheme.lower() != "https":
+                raise InstallerError("HAOS image download did not remain on HTTPS")
             header_size = resp.headers.get("Content-Length")
             if header_size:
                 try:
@@ -534,6 +647,22 @@ def resolve_manifest_path(manifest_arg: str|None, vm_name: str) -> Path:
         return Path(manifest_arg).expanduser().resolve()
     return Path("/tmp") / f"haos-installer-{vm_name}-manifest.json"
 
+def read_manifest_file(path: Path) -> dict:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+            raise InstallerError("Resume manifest must be a regular file that is not group/world-writable")
+        if info.st_size > 1024 * 1024:
+            raise InstallerError("Resume manifest exceeds the 1 MiB safety limit")
+        with os.fdopen(fd, "r") as source:
+            fd = -1
+            return json.load(source)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
 def create_manifest(path: Path, plan: Plan) -> dict:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,16 +694,20 @@ def install(client, plan: Plan, args):
     if os.geteuid() != 0:
         raise InstallerError("Live installation requires a root TrueNAS shell because qemu-img must write to /dev/zvol. No new resources were created by this run; rerun as root or use --resume-manifest after a partial run.")
     require_tools_for_install(False)
-    manifest_path = Path(args.resume_manifest).expanduser().resolve() if args.resume_manifest else resolve_manifest_path(args.manifest, plan.vm_name)
+    manifest_path = Path(args.resume_manifest).expanduser() if args.resume_manifest else resolve_manifest_path(args.manifest, plan.vm_name)
+    saved_vm_name = plan.vm_name
     if args.resume_manifest:
         try:
-            manifest = json.loads(manifest_path.read_text())
+            manifest = read_manifest_file(manifest_path)
         except (OSError, json.JSONDecodeError) as exc:
             raise InstallerError(f"Cannot read resume manifest at {manifest_path}") from exc
         saved_plan = manifest.get("plan")
         current_plan = dataclasses.asdict(plan)
         if manifest.get("tool") != APP or not isinstance(saved_plan, dict):
             raise InstallerError("Resume manifest identity or plan is invalid")
+        saved_vm_name = saved_plan.get("vm_name")
+        if not isinstance(saved_vm_name, str) or not saved_vm_name or len(saved_vm_name) > 63:
+            raise InstallerError("Resume manifest saved VM name is invalid")
         if saved_plan != current_plan:
             without_name = dict(current_plan)
             without_name["vm_name"] = saved_plan.get("vm_name")
@@ -608,14 +741,21 @@ def install(client, plan: Plan, args):
             zvol_matches = client.call("pool.dataset.query", [[["id","=",plan.zvol]]])
             if len(parent_matches) != 1 or parent_matches[0].get("type") != "FILESYSTEM":
                 raise InstallerError("Resume parent dataset no longer matches the manifest")
+            if any(r.get("type") == "dataset" and r.get("id") == parent for r in manifest.get("resources", [])):
+                if dataset_comment(parent_matches[0]) != f"Created by {APP} for HAOS VM disks":
+                    raise InstallerError("Resume parent dataset ownership marker changed")
             if len(zvol_matches) != 1 or zvol_matches[0].get("type") != "VOLUME":
                 raise InstallerError("Resume zvol no longer matches the manifest")
+            if dataset_comment(zvol_matches[0]) != f"Created by {APP} for {saved_vm_name}":
+                raise InstallerError("Resume zvol ownership marker changed; refusing to overwrite it")
             volsize = zvol_matches[0].get("volsize")
             if isinstance(volsize, dict): volsize = volsize.get("parsed")
             if int(volsize or 0) != plan.disk_gib * 1024**3 or {"type":"zvol","id":plan.zvol,"dev":dev} not in manifest.get("resources",[]):
                 raise InstallerError("Resume zvol size or manifest ownership check failed")
-            if any(vm.get("name") == plan.vm_name for vm in client.call("vm.query")):
-                raise InstallerError(f"VM {plan.vm_name!r} appeared after resume planning; refusing to continue")
+            if any(vm.get("name") in {saved_vm_name, plan.vm_name} for vm in client.call("vm.query")):
+                raise InstallerError("A VM with the saved or requested name appeared after resume planning; refusing to continue")
+            if any((device.get("attributes") or {}).get("path") == dev for device in client.call("vm.device.query")):
+                raise InstallerError("The resume zvol became attached to a VM device; refusing to overwrite it")
         else:
             parent_matches = client.call("pool.dataset.query", [[["id","=",parent]]])
             if parent_matches:
@@ -687,6 +827,8 @@ def parse_args(argv=None):
     ap.add_argument("--username", default=os.getenv("TRUENAS_USERNAME"))
     ap.add_argument("--password", default=os.getenv("TRUENAS_PASSWORD"))
     ap.add_argument("--api-key", default=os.getenv("TRUENAS_API_KEY"))
+    ap.add_argument("--tls-ca-cert", default=os.getenv("TRUENAS_CA_CERT"), help="PEM CA certificate file for a self-signed/private TrueNAS WSS certificate")
+    ap.add_argument("--insecure-tls", action="store_true", help="Explicitly disable TLS certificate and hostname verification for legacy self-signed setups; prefer --tls-ca-cert")
     ap.add_argument("--pool")
     ap.add_argument("--nic")
     ap.add_argument("--vm-name")
@@ -726,7 +868,7 @@ def main(argv=None):
     if not local_midclt and args.preview and not args.api_key and args.username and args.password is None:
         args.password = getpass.getpass("TrueNAS password (for read-only preview): ")
     with lockfile(args.lock_file):
-        client = MidcltClient() if local_midclt else TrueNASClient(args.truenas_url, args.username, args.password, args.api_key)
+        client = MidcltClient() if local_midclt else TrueNASClient(args.truenas_url, args.username, args.password, args.api_key, tls_ca_cert=args.tls_ca_cert, insecure_tls=args.insecure_tls)
         try:
             plan, meta = build_plan(client, args)
             print_plan(plan, meta)
