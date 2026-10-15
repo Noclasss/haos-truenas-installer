@@ -4,21 +4,25 @@ Guided, conservative installer for creating a **new** Home Assistant OS VM on Tr
 
 This project is for community users who want a one-command, guided HAOS install on TrueNAS. It is deliberately labelled **BETA**: it refuses duplicate resources, has a read-only preview mode, and only claims compatibility for versions that have been checked against API schemas.
 
-## One-command launcher
+## One-command guided launcher
 
-Pinned to a commit is safest. Replace `<commit>` with a published commit SHA from this repository. Preview mode may be run from `main`, but live installs intentionally refuse an unpinned `main` launcher unless you set `HAOS_TRUENAS_ALLOW_UNPINNED=1`.
+Replace `<commit>` with a published commit SHA from this repository. The installer is interactive when you leave the pool, network, VM name, resource, and disk-size options off the command line. It will show the complete plan and wait for you to type `CREATE` before making changes. The pool menu chooses the TrueNAS storage pool for the VM disk; it does not select or repartition a physical drive.
+
+Run a read-only preview first:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | HAOS_TRUENAS_INSTALLER_REF=<commit> sh -s -- --preview
 ```
 
-When the preview looks correct, run without `--preview`:
+When the preview looks right, run this one-line guided install from a root shell, or keep `sudo` as shown:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | HAOS_TRUENAS_INSTALLER_REF=<commit> sh
+curl -fsSL https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/<commit>/install.sh | sudo env HAOS_TRUENAS_INSTALLER_REF=<commit> sh -s -- --no-start
 ```
 
-You can also set `HAOS_TRUENAS_INSTALLER_REF=<commit>` when using the launcher from a branch copy of `install.sh`.
+The prompts let you choose the healthy storage pool, existing network attachment, VM name, CPU and RAM, and virtual disk size. The installer then displays the selected pool, zvol path and size, network, VM settings, and start behavior. Review that plan carefully; type `CREATE` only if it is correct. `--no-start` leaves the new VM powered off so you can start it yourself after creation.
+
+Preview mode may be run from `main`, but live installs intentionally refuse an unpinned `main` launcher unless you set `HAOS_TRUENAS_ALLOW_UNPINNED=1`. You can also set `HAOS_TRUENAS_INSTALLER_REF=<commit>` when using the launcher from a branch copy of `install.sh`.
 
 For local testing from a clone:
 
