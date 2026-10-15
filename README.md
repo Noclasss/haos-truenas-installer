@@ -30,6 +30,10 @@ For local testing from a clone:
 python3 haos_truenas_installer.py --preview
 ```
 
+## Ubuntu Server VM installer (separate BETA)
+
+There is now a separate experimental installer for a new Ubuntu Server 26.04 LTS VM. It does not change the HAOS installer and does not support Ubuntu Desktop yet. It is mocked-tested only; no live Ubuntu VM has been created. Read its requirements and status in [`ubuntu-server/README.md`](ubuntu-server/README.md) before using it.
+
 ## What it does
 
 - Checks TrueNAS version and required VM/storage/network API methods.
