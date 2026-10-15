@@ -19,7 +19,7 @@ A separate guided installer for a **new Ubuntu Server 26.04 LTS VM** on TrueNAS 
 - Builds a unique NoCloud seed ISO for first boot. It creates an admin user with the supplied **public** SSH key, disables SSH password login and root SSH login, and never asks for or stores a private key or password.
 - Requires the live TrueNAS method schema to advertise the VM, disk, NIC, CD-ROM, path and device-order fields before it proceeds.
 - Writes a restrictive local task manifest before downloads or TrueNAS resource changes and records created resources as the run progresses.
-- Requires typing `CREATE` unless `--yes` is explicitly passed. The default is `--no-start`; `--start` is the opt-in to power on the VM after creation.
+- Requires typing `CREATE` unless `--yes` is explicitly passed. The VM is left powered off by default; `--start` is the opt-in to power it on after creation.
 
 ## Requirements
 
@@ -35,9 +35,21 @@ If a required tool is missing, the installer stops before creating TrueNAS resou
 
 ## Preview
 
-Run the pinned launcher with `--preview` before any live attempt. Preview queries TrueNAS and prints the plan; it does not download the Ubuntu image, create a manifest, or modify TrueNAS.
+The launcher is pinned to installer commit `c2191eeb843adbf1597690254678e057b911623b`. Run a read-only preview first:
 
-The interactive live flow prompts for pool, NIC, VM name, hostname, Linux username and resources. It then asks you to paste one SSH **public** key line. The private key stays on your own computer. Alternatively, pass `--ssh-public-key-file` for a public-key file present on the TrueNAS host.
+```sh
+REF=c2191eeb843adbf1597690254678e057b911623b; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/ubuntu-server/install.sh" | UBUNTU_TRUENAS_INSTALLER_REF="$REF" sh -s -- --preview
+```
+
+Preview queries TrueNAS and prints the plan; it does not download the Ubuntu image, create a manifest, or modify TrueNAS.
+
+For a disposable live test, run from a root TrueNAS shell only after the preview is correct and the listed host tools are present:
+
+```sh
+REF=c2191eeb843adbf1597690254678e057b911623b; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/ubuntu-server/install.sh" | UBUNTU_TRUENAS_INSTALLER_REF="$REF" sh -s -- --test-limits
+```
+
+This still requires typing `CREATE`. It leaves the VM powered off unless `--start` is explicitly added. The interactive live flow prompts for pool, NIC, VM name, hostname, Linux username and resources, then asks you to paste one SSH **public** key line. The private key stays on your own computer. Alternatively, pass `--ssh-public-key-file` for a public-key file present on the TrueNAS host.
 
 ## First boot
 

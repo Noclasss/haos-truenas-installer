@@ -32,7 +32,21 @@ python3 haos_truenas_installer.py --preview
 
 ## Ubuntu Server VM installer (separate BETA)
 
-There is now a separate experimental installer for a new Ubuntu Server 26.04 LTS VM. It does not change the HAOS installer and does not support Ubuntu Desktop yet. It is mocked-tested only; no live Ubuntu VM has been created. Read its requirements and status in [`ubuntu-server/README.md`](ubuntu-server/README.md) before using it.
+There is a separate experimental installer for a new Ubuntu Server 26.04 LTS VM. It does not change the HAOS installer and does not support Ubuntu Desktop yet. It is mocked-tested only; no live Ubuntu VM has been created. Read its requirements and status in [`ubuntu-server/README.md`](ubuntu-server/README.md).
+
+Pinned read-only preview:
+
+```sh
+REF=c2191eeb843adbf1597690254678e057b911623b; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/ubuntu-server/install.sh" | UBUNTU_TRUENAS_INSTALLER_REF="$REF" sh -s -- --preview
+```
+
+Do not run the live command until the preview is correct and required host tools are present. The live installer requires a root TrueNAS shell and still asks for confirmation:
+
+```sh
+REF=c2191eeb843adbf1597690254678e057b911623b; curl -fsSL "https://raw.githubusercontent.com/Noclasss/haos-truenas-installer/$REF/ubuntu-server/install.sh" | UBUNTU_TRUENAS_INSTALLER_REF="$REF" sh -s -- --test-limits
+```
+
+The live test uses 2 vCPU, 2 GiB RAM and a 32 GiB virtual disk, leaves the VM powered off, and requires typing `CREATE`.
 
 ## What it does
 
