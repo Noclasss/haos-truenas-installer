@@ -155,10 +155,10 @@ Use a unique name. Keep the manifest. Clean up only resources positively identif
 
 ## Accessing Home Assistant
 
-After the VM starts, HAOS can take several minutes to boot and download initial components. Try:
+If you used `--no-start`, start the VM in TrueNAS and open its console to monitor first boot. Once HAOS is booted, try:
 
-- <http://homeassistant.local:8123/>
+- <http://homeassistant.local/>
+- <http://homeassistant.local:8123/> if the first URL does not load
 - the VM IP shown in your router/DHCP leases
-- the VM console/display in TrueNAS
 
-Do not restore a production backup into a disposable test VM unless that is your explicit, separate goal.
+The TrueNAS VM console is useful for watching startup and diagnosing boot issues. Do not restore a production backup into a disposable test VM unless that is your explicit, separate goal.

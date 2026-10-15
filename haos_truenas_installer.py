@@ -473,7 +473,11 @@ def install(client, plan: Plan, args):
     if plan.start_vm:
         client.call("vm.start", [vm_id, {"overcommit": False}])
     print("\nCreated HAOS VM successfully.")
-    print("Wait a few minutes, then visit http://homeassistant.local:8123/ or check your router/DHCP leases for the VM IP.")
+    if plan.start_vm:
+        print("The VM is running. Open its console in TrueNAS to monitor the first boot.")
+    else:
+        print("The VM is powered off (--no-start). Start it in TrueNAS, then open its console to monitor the first boot.")
+    print("Once booted, try http://homeassistant.local/; if needed use http://homeassistant.local:8123/ or the VM IP from DHCP.")
     print(f"Keep this manifest for safe recovery/removal: {manifest_path}")
 
 def random_mac() -> str:
