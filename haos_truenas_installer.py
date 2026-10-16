@@ -461,6 +461,128 @@ def build_resume_plan(client, args, info: dict, version: str, required: list[str
         plan = dataclasses.replace(plan, preview=True)
     return plan, {"info":info,"methods_checked":required,"haos_asset":asset,"resume":True}
 
+def _schema_matches(value, schema, path="argument", root=None):
+    """Check a payload against the JSON-schema subset emitted by middleware."""
+    if not isinstance(schema, dict):
+        return [f"{path}: middleware schema node is malformed"]
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        target = root
+        try:
+            if not isinstance(ref, str) or not ref.startswith("#/") or target is None:
+                raise KeyError(ref)
+            for part in ref[2:].split("/"):
+                target = target[part.replace("~1", "/").replace("~0", "~")]
+        except (KeyError, TypeError):
+            return [f"{path}: unresolved middleware schema reference {ref!r}"]
+        return _schema_matches(value, target, path, root)
+    if "const" in schema and value != schema["const"]:
+        return [f"{path}: expected {schema['const']!r}"]
+    if "enum" in schema and value not in schema["enum"]:
+        return [f"{path}: value {value!r} is not allowed by middleware enum"]
+    if "oneOf" in schema:
+        matches = [variant for variant in schema["oneOf"] if not _schema_matches(value, variant, path, root)]
+        return [] if len(matches) == 1 else [f"{path}: must match exactly one middleware variant; matched {len(matches)}"]
+    if "anyOf" in schema:
+        return [] if any(not _schema_matches(value, variant, path, root) for variant in schema["anyOf"]) else [f"{path}: does not match any middleware alternative"]
+
+    expected = schema.get("type")
+    if expected:
+        choices = expected if isinstance(expected, list) else [expected]
+        def valid_type(kind):
+            return ((kind == "object" and isinstance(value, dict)) or
+                    (kind == "array" and isinstance(value, list)) or
+                    (kind == "string" and isinstance(value, str)) or
+                    (kind == "integer" and isinstance(value, int) and not isinstance(value, bool)) or
+                    (kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool)) or
+                    (kind == "boolean" and isinstance(value, bool)) or
+                    (kind == "null" and value is None))
+        if not any(valid_type(kind) for kind in choices):
+            return [f"{path}: expected type {' or '.join(choices)}, got {type(value).__name__}"]
+
+    errors = []
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []))
+        required.update(k for k, spec in properties.items() if spec.get("_required_") is True)
+        errors.extend(f"{path}.{key}: required field is missing" for key in sorted(required - value.keys()))
+        if schema.get("additionalProperties") is False:
+            errors.extend(f"{path}.{key}: field is not accepted" for key in sorted(value.keys() - properties.keys()))
+        for key, item in value.items():
+            if key in properties:
+                errors.extend(_schema_matches(item, properties[key], f"{path}.{key}", root))
+    elif isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for index, item in enumerate(value):
+                errors.extend(_schema_matches(item, items, f"{path}[{index}]", root))
+        elif isinstance(items, list):
+            for index, item_schema in enumerate(items[:len(value)]):
+                errors.extend(_schema_matches(value[index], item_schema, f"{path}[{index}]", root))
+    elif isinstance(value, str):
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", float("inf")):
+            errors.append(f"{path}: string length is outside middleware bounds")
+        pattern = schema.get("pattern")
+        if pattern is not None and re.search(pattern, value) is None:
+            errors.append(f"{path}: string does not match middleware pattern")
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value < schema.get("minimum", float("-inf")) or value > schema.get("maximum", float("inf")):
+            errors.append(f"{path}: number is outside middleware bounds")
+    return errors
+
+
+def validate_method_request(methods, method, params):
+    metadata = methods.get(method)
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("accepts"), list):
+        raise InstallerError(f"TrueNAS runtime schema for {method} has no accepted-arguments definition")
+    accepts = metadata["accepts"]
+    if len(params) > len(accepts):
+        raise InstallerError(f"Installer request for {method} has too many positional arguments")
+    for index, schema in enumerate(accepts):
+        if index >= len(params):
+            if schema.get("_required_") is True:
+                raise InstallerError(f"Installer request for {method} omits required argument {schema.get('_name_', index)!r}")
+            continue
+        errors = _schema_matches(params[index], schema, f"{method}[{schema.get('_name_', index)}]", metadata)
+        if errors:
+            raise InstallerError(f"TrueNAS runtime schema mismatch: {errors[0]}")
+
+
+def call_checked_write(client, method, params):
+    methods = getattr(client, "runtime_methods", None)
+    if methods is None:
+        methods = client.call("core.get_methods")
+        if not isinstance(methods, dict):
+            raise InstallerError("TrueNAS did not return runtime method schemas before write")
+        client.runtime_methods = methods
+    validate_method_request(methods, method, params)
+    return client.call(method, params)
+
+
+def validate_api_methods(methods):
+    sample_vm = {
+        "name": "SchemaCheck", "description": f"Home Assistant OS VM created by {APP} (BETA)",
+        "vcpus": 2, "cores": 2, "threads": 1, "memory": 4096, "min_memory": None,
+        "cpu_mode": "HOST-MODEL", "bootloader": "UEFI", "bootloader_ovmf": "OVMF_CODE.fd",
+        "trusted_platform_module": False, "autostart": False, "ensure_display_device": True, "time": "UTC",
+    }
+    requests = {
+        "pool.dataset.create": [
+            [{"name": "tank/haos-vms/schemacheck", "type": "FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}],
+            [{"name": "tank/haos-vms/schemacheck", "type": "VOLUME", "volsize": 64 * 1024**3, "comments": f"Created by {APP} for SchemaCheck"}],
+        ],
+        "vm.create": [[sample_vm]],
+        "vm.device.create": [
+            [{"vm": 1, "attributes": {"dtype": "DISK", "path": "/dev/zvol/tank/haos-vms/schemacheck", "type": "VIRTIO", "create_zvol": False, "iotype": "THREADS"}}],
+            [{"vm": 1, "attributes": {"dtype": "NIC", "type": "VIRTIO", "nic_attach": "br-schema", "mac": "02:00:00:00:00:01"}}],
+        ],
+        "vm.start": [[1, {"overcommit": False}]],
+    }
+    for method, examples in requests.items():
+        for params in examples:
+            validate_method_request(methods, method, params)
+
+
 def build_plan(client, args) -> tuple[Plan, dict]:
     info = client.call("system.info")
     version = client.call("system.version")
@@ -469,6 +591,8 @@ def build_plan(client, args) -> tuple[Plan, dict]:
     missing = [m for m in required if m not in methods]
     if missing:
         raise InstallerError("Required TrueNAS VM/storage API methods are missing: " + ", ".join(missing))
+    validate_api_methods(methods)
+    client.runtime_methods = methods
     if not version_supported(version):
         if not args.preview or not args.allow_unsupported_version:
             raise InstallerError(f"Unsupported TrueNAS version {version}. This BETA supports 25.10.x and 26.0.0-BETA.x. Unsupported versions may only be evaluated in read-only preview mode with --allow-unsupported-version; live installs remain blocked.")
@@ -800,9 +924,9 @@ def install(client, plan: Plan, args):
                 if any(d.get("type") != "FILESYSTEM" for d in parent_matches):
                     raise InstallerError(f"Parent dataset {parent!r} exists but is not a filesystem; refusing to use it")
             else:
-                client.call("pool.dataset.create", [{"name": parent, "type":"FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}])
+                call_checked_write(client, "pool.dataset.create", [{"name": parent, "type":"FILESYSTEM", "comments": f"Created by {APP} for HAOS VM disks"}])
                 manifest["resources"].append({"type":"dataset", "id":parent}); update_manifest(manifest_path, manifest)
-            client.call("pool.dataset.create", [{"name": plan.zvol, "type":"VOLUME", "volsize": plan.disk_gib * 1024**3, "comments": f"Created by {APP} for {plan.vm_name}"}])
+            call_checked_write(client, "pool.dataset.create", [{"name": plan.zvol, "type":"VOLUME", "volsize": plan.disk_gib * 1024**3, "comments": f"Created by {APP} for {plan.vm_name}"}])
             manifest["resources"].append({"type":"zvol", "id":plan.zvol, "dev":dev}); update_manifest(manifest_path, manifest)
         if not Path(dev).exists():
             raise InstallerError(f"Created zvol device path is not visible: {dev}")
@@ -810,7 +934,7 @@ def install(client, plan: Plan, args):
             raise InstallerError(f"No write permission for {dev}; run the installer from a root TrueNAS shell")
         # Destination is only a newly created or manifest-verified zvol.
         convert_qcow_to_zvol(qcow, dev, manifest_path)
-    vm = client.call("vm.create", [{
+    vm = call_checked_write(client, "vm.create", [{
         "name": plan.vm_name,
         "description": f"Home Assistant OS VM created by {APP} (BETA)",
         "vcpus": plan.vcpus,
@@ -828,12 +952,12 @@ def install(client, plan: Plan, args):
     }])
     vm_id = vm["id"]
     manifest["resources"].append({"type":"vm", "id":vm_id, "name":plan.vm_name}); update_manifest(manifest_path, manifest)
-    disk = client.call("vm.device.create", [{"vm": vm_id, "attributes":{"dtype":"DISK", "path":dev, "type":"VIRTIO", "create_zvol":False, "iotype":"THREADS"}}])
+    disk = call_checked_write(client, "vm.device.create", [{"vm": vm_id, "attributes":{"dtype":"DISK", "path":dev, "type":"VIRTIO", "create_zvol":False, "iotype":"THREADS"}}])
     manifest["resources"].append({"type":"device", "id":disk["id"], "kind":"DISK"}); update_manifest(manifest_path, manifest)
-    nic = client.call("vm.device.create", [{"vm": vm_id, "attributes":{"dtype":"NIC", "type":"VIRTIO", "nic_attach":plan.nic_attach, "mac": random_mac()}}])
+    nic = call_checked_write(client, "vm.device.create", [{"vm": vm_id, "attributes":{"dtype":"NIC", "type":"VIRTIO", "nic_attach":plan.nic_attach, "mac": random_mac()}}])
     manifest["resources"].append({"type":"device", "id":nic["id"], "kind":"NIC"}); update_manifest(manifest_path, manifest)
     if plan.start_vm:
-        client.call("vm.start", [vm_id, {"overcommit": False}])
+        call_checked_write(client, "vm.start", [vm_id, {"overcommit": False}])
     print("\nCreated HAOS VM successfully.")
     if plan.start_vm:
         print("The VM is running. Open its console in TrueNAS to monitor the first boot.")

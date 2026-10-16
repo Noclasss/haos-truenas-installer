@@ -32,7 +32,7 @@ python3 haos_truenas_installer.py --preview
 
 ## What it does
 
-- Checks TrueNAS version and required VM/storage/network API methods.
+- Checks TrueNAS version and required VM/storage/network API methods, then validates the installer's dataset, zvol, VM, disk, NIC and VM-start request shapes against the live `core.get_methods` schemas. Exact payloads are rechecked immediately before each middleware write.
 - Lists healthy pools and existing VM network attachment choices.
 - Uses alphanumeric-only VM names as required by the TrueNAS VM API.
 - Requires an explicit healthy storage-pool selection when `--pool` is not supplied; it displays each pool's free and total capacity and never chooses by emptiest-pool ranking.

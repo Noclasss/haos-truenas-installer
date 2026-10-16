@@ -578,6 +578,49 @@ class ImagePreparationTests(unittest.TestCase):
             self.assertEqual([p.name for p in pathlib.Path(d).iterdir()], ["haos.xz"])
 
 
+def schema_field(kind, required=False, enum=None, const=None):
+    result = {"type": kind, "_required_": required}
+    if enum is not None:
+        result["enum"] = enum
+    if const is not None:
+        result["const"] = const
+    return result
+
+
+def schema_object(properties, required=False):
+    return {"type": "object", "additionalProperties": False, "properties": properties, "_required_": required}
+
+
+def method_schemas():
+    dataset = {"oneOf": [
+        schema_object({"name": schema_field("string", True), "type": schema_field("string", const="FILESYSTEM"), "comments": schema_field("string")}, True),
+        schema_object({"name": schema_field("string", True), "type": schema_field("string", const="VOLUME"), "volsize": schema_field("integer", True), "comments": schema_field("string")}, True),
+    ]}
+    vm_properties = {
+        "name": schema_field("string", True), "description": schema_field("string"),
+        "vcpus": schema_field("integer"), "cores": schema_field("integer"), "threads": schema_field("integer"),
+        "memory": schema_field("integer", True), "cpu_mode": schema_field("string", enum=["CUSTOM", "HOST-MODEL", "HOST-PASSTHROUGH"]),
+        "bootloader": schema_field("string", enum=["UEFI_CSM", "UEFI"]), "bootloader_ovmf": {"anyOf": [schema_field("string"), schema_field("null")]},
+        "trusted_platform_module": schema_field("boolean"), "autostart": schema_field("boolean"),
+        "ensure_display_device": schema_field("boolean"), "time": schema_field("string", enum=["LOCAL", "UTC"]),
+        "min_memory": {"anyOf": [schema_field("integer"), schema_field("null")]},
+    }
+    devices = []
+    for kind, props in (
+        ("DISK", {"path": schema_field("string"), "type": schema_field("string", enum=["AHCI", "VIRTIO"]), "create_zvol": schema_field("boolean"), "iotype": schema_field("string", enum=["NATIVE", "THREADS", "IO_URING"])}),
+        ("NIC", {"type": schema_field("string", enum=["E1000", "VIRTIO"]), "nic_attach": schema_field("string"), "mac": schema_field("string")}),
+        ("CDROM", {"path": schema_field("string")}),
+    ):
+        devices.append(schema_object({"dtype": schema_field("string", True, const=kind), **props}, True))
+    device = schema_object({"vm": schema_field("integer", True), "order": schema_field("integer"), "attributes": {"oneOf": devices, "_required_": True}}, True)
+    methods = {name: {} for name in ("vm.create", "vm.start", "vm.stop", "vm.query", "vm.device.create", "vm.device.delete", "vm.device.query", "vm.device.nic_attach_choices", "pool.dataset.create", "pool.dataset.query", "pool.query", "interface.query")}
+    methods["pool.dataset.create"] = {"accepts": [dataset]}
+    methods["vm.create"] = {"accepts": [schema_object(vm_properties, True)]}
+    methods["vm.device.create"] = {"accepts": [device]}
+    methods["vm.start"] = {"accepts": [schema_field("integer", True), schema_object({"overcommit": schema_field("boolean")})]}
+    return methods
+
+
 class FakeClient:
     def __init__(self, responses):
         self.responses = responses
@@ -589,7 +632,7 @@ class FakeClient:
 
 class PlanTests(unittest.TestCase):
     def base_client(self):
-        methods = {m:{} for m in ["vm.create","vm.start","vm.stop","vm.query","vm.device.create","vm.device.delete","vm.device.query","vm.device.nic_attach_choices","pool.dataset.create","pool.dataset.query","pool.query","interface.query"]}
+        methods = method_schemas()
         return FakeClient({
             "system.info": {"physmem": 16*1024**3},
             "system.version": "TrueNAS-26.0.0-BETA.2",
@@ -613,6 +656,22 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.disk_gib, 64)
         write_calls = [c for c in client.calls if c[0] in {"vm.create","pool.dataset.create","vm.device.create","vm.start"}]
         self.assertEqual(write_calls, [])
+
+    def test_runtime_schema_preflight_rejects_enum_change_before_any_write(self):
+        client = self.base_client()
+        disk = next(v for v in client.responses["core.get_methods"]["vm.device.create"]["accepts"][0]["properties"]["attributes"]["oneOf"] if v["properties"]["dtype"].get("const") == "DISK")
+        disk["properties"]["type"]["enum"] = ["AHCI"]
+        with self.assertRaisesRegex(installer.InstallerError, "must match exactly one middleware variant"):
+            installer.build_plan(client, self.args())
+        self.assertFalse(any(c[0] in {"pool.dataset.create", "vm.create", "vm.device.create", "vm.start"} for c in client.calls))
+
+    def test_exact_runtime_schema_mismatch_blocks_write_call(self):
+        client = self.base_client()
+        installer.build_plan(client, self.args())
+        before = list(client.calls)
+        with self.assertRaisesRegex(installer.InstallerError, "expected type integer"):
+            installer.call_checked_write(client, "vm.start", ["not-a-vm-id", {"overcommit": False}])
+        self.assertEqual(client.calls, before)
     def test_invalid_pool_path_is_rejected_before_resource_checks(self):
         client = self.base_client()
         with self.assertRaisesRegex(installer.InstallerError, "Invalid pool name"):
@@ -729,7 +788,9 @@ class PlanTests(unittest.TestCase):
             path.write_text(installer.json.dumps({"tool":installer.APP,"plan":installer.dataclasses.asdict(saved_plan),"resources":resources}))
             args = installer.parse_args(["--resume-manifest", str(path), "--vm-name", plan.vm_name, "--no-start"])
             class ResumeClient:
-                def __init__(self): self.calls=[]
+                def __init__(self):
+                    self.calls=[]
+                    self.runtime_methods=method_schemas()
                 def call(self, method, params=None):
                     self.calls.append((method,params))
                     if method == "pool.dataset.query":
@@ -796,7 +857,9 @@ class PlanTests(unittest.TestCase):
             args = installer.parse_args(["--vm-name", plan.vm_name, "--manifest", str(path), "--no-start"])
             args.cache_dir = str(pathlib.Path(d) / "cache")
             class FailingNicClient:
-                def __init__(self): self.calls=[]
+                def __init__(self):
+                    self.calls=[]
+                    self.runtime_methods=method_schemas()
                 def call(self, method, params=None):
                     self.calls.append((method, params))
                     if method == "pool.dataset.query": return []
