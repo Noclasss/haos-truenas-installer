@@ -15,9 +15,7 @@ A version may be added only after:
 ## Checked versions
 
 - `TrueNAS-26.0.0-BETA.2`
-  - Read-only discovery performed against live API schema.
-  - Required VM/storage/network methods were present.
-  - Existing resources were inventoried privately and not published.
+  - The user-provided `TrueNAS-26.0.0-BETA.2` `core.get_methods` capture was parsed locally (805 method definitions). The installer now validates filesystem-dataset, zvol, VM, DISK/NIC, and VM-start payload templates against accepted argument schemas, and rechecks exact write payloads immediately before invocation. This is schema evidence only; no write was executed as part of this validator change.
   - On 2026-10-15, a user-reported full live install and completed HAOS onboarding succeeded with the official Home Assistant OS 18.3 image using installer code commit `7494d9711f1656fbf88bbe3f7a2801cac50046e7`.
   - The disposable test VM and installer-created storage were removed after validation; unrelated VMs and devices were preserved.
   - This is a single-environment validation, not a claim for other TrueNAS releases.
